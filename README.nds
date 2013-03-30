@@ -1,0 +1,66 @@
+Welcome to the Naive Disk Store.  It is an attempt to see if a really
+stupidly-simple disk-backed store has any hope of working with Redis.  The
+intended use case is for a redis instance that stores a lot of data, but
+with a relatively small active set of keys.  
+
+At the time of writing, NDS is implemented by persisting every change to a
+key to a GDBM database.  When a key isn't found in memory, the GDBM database
+is checked to see if the key exists.  The plan is that you can keep memory
+usage of your redis instance under control by setting maxmemory (with an
+allkeys-lru eviction policy, preferably) and as space is required, unused
+keys get evicted from memory.  When they're needed again in the future,
+however, they're available on disk.
+
+There are one or two "side benefits" to using NDS.  They're not the reason
+*why* it was written, but they're useful anyway.  Whether they're worth it
+for your use-case is up to you.
+
+* Very, very short "startup" time.  Instead of having to load a large RDB or
+  AOF into memory, the redis instance can immediately start serving
+  requests.  The performance will be poor until the popular keys are all
+  in-memory, but often slow operation is better than no operation.
+
+* Disk-efficient, real-time persistence.  Disk space usage isn't
+  significantly more than an RDB file, and you never have to trigger a
+  rewrite or a complete dump -- and yet, you still get up-to-date
+  persistence.
+
+
+DEPLOYING
+
+Build with USE_NDS=yes:
+
+    make USE_NDS=yes
+
+The resulting redis-server binary will store all its data in your data
+directory, in freezer.gdbm.
+
+TODO
+
+NDS is very new, and shouldn't be relied upon for anything really important. 
+There are a number of things that need to be fixed before it is of any use
+to anyone:
+
+* Runtime configuration.  At the moment, to enable NDS you need to rebuild
+  with a special flag enabled.  It'd be nice to be able to turn NDS on at
+  runtime.  This shouldn't be spectacularly hard to do.
+
+* No multi-database support.  Personally, I think that running multi-database
+  is a dumb idea anyway (Redises are cheap), but if you use multi-database,
+  then NDS isn't for you.  Moving to a GDBM file-per-database would probably
+  be the best thing to do.
+
+* Async flushing.  If you're happy with potentially losing a small amount of
+  data in the event of a crash, it would be delightful to be able to flush
+  dirty keys out to the GDBM file periodically, rather than the synchronous
+  writing.  That would return Redis itself to close to its current
+  performance level, while still having nearly-real-time persistence.
+  
+* Stats.  It'd be nice to get cache hit rates, read and write counts, and
+  all that sort of good stuff out of redis.
+
+* A better data file format.  GDBM isn't amazingly quick, and most
+  importantly it doesn't allow writes while someone's reading.  This isn't a
+  huge problem now, but when we start periodically flushing, fetching keys
+  from disk will stall while dirty keys are flushed.  This is kinda bad.  An
+  append-only format, like AODBM, would be almost ideal.
