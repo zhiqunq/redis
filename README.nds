@@ -59,3 +59,8 @@ to anyone:
   huge problem now, but when we start periodically flushing, fetching keys
   from disk will stall while dirty keys are flushed.  This is kinda bad.  An
   append-only format, like AODBM, would be almost ideal.
+
+* Keys lose their TTLs when they get stashed.  This presumably just involves
+  modifying the data dumper/loader to include setting the TTL (as is done in
+  full RDB files, probably).  I'll likely leave this for someone who uses
+  TTLs on their keys.
