@@ -3,8 +3,17 @@
 #include "redis.h"
 #include "nds.h"
 
+#include <stdio.h>
+
+#define FREEZER_FILENAME_LEN 255
+
+void freezer_filename(redisDb *db, char *buf) {
+    snprintf(buf, FREEZER_FILENAME_LEN-1, "freezer_%i.gdbm", db->id);
+}
+
 robj *getNDS(redisDb *db, robj *key) {
     /* Perhaps it's in the freezer... */
+    char freezer_file[FREEZER_FILENAME_LEN];
     GDBM_FILE freezer;
     datum frz_key, frz_val;
     rio payload;
@@ -12,9 +21,10 @@ robj *getNDS(redisDb *db, robj *key) {
     robj *obj = NULL;
     
     redisLog(REDIS_DEBUG, "Looking up %s in NDS", (char *)key->ptr);
-    freezer = gdbm_open("freezer.gdbm", 0, GDBM_READER, 0640, NULL);
+    freezer_filename(db, freezer_file);
+    freezer = gdbm_open(freezer_file, 0, GDBM_READER, 0640, NULL);
     if (!freezer) {
-        redisLog(REDIS_WARNING, "Could not open freezer.gdbm");
+        redisLog(REDIS_WARNING, "Could not open %s: %s", freezer_file, gdbm_strerror(gdbm_errno));
         return NULL;
     }
     
@@ -50,6 +60,7 @@ nds_cleanup:
 }
 
 void setNDS(redisDb *db, robj *key, robj *val) {
+    char freezer_file[FREEZER_FILENAME_LEN];
     GDBM_FILE freezer;
     datum frz_key, frz_val;
     rio payload;
@@ -64,9 +75,10 @@ void setNDS(redisDb *db, robj *key, robj *val) {
     }
         
     redisLog(REDIS_DEBUG, "Writing %s to NDS", (char *)key->ptr);
-    freezer = gdbm_open("freezer.gdbm", 0, GDBM_WRCREAT, 0640, NULL);
+    freezer_filename(db, freezer_file);
+    freezer = gdbm_open(freezer_file, 0, GDBM_WRCREAT, 0640, NULL);
     if (!freezer) {
-        redisLog(REDIS_WARNING, "Could not open freezer.gdbm");
+        redisLog(REDIS_WARNING, "Could not open %s: %s", freezer_file, gdbm_strerror(gdbm_errno));
         return;
     }
         
@@ -86,14 +98,16 @@ void setNDS(redisDb *db, robj *key, robj *val) {
  * 1 if it was.  -1 is returned on error.
  */
 int delNDS(redisDb *db, robj *key) {
+    char freezer_file[FREEZER_FILENAME_LEN];
     GDBM_FILE freezer;
     datum frz_key;
     int rv;
     
     redisLog(REDIS_DEBUG, "Deleting %s from NDS", (char *)key->ptr);
-    freezer = gdbm_open("freezer.gdbm", 0, GDBM_WRCREAT, 0640, NULL);
+    freezer_filename(db, freezer_file);
+    freezer = gdbm_open(freezer_file, 0, GDBM_WRCREAT, 0640, NULL);
     if (!freezer) {
-        redisLog(REDIS_WARNING, "Could not open freezer.gdbm");
+        redisLog(REDIS_WARNING, "Could not open %s: %s", freezer_file, gdbm_strerror(gdbm_errno));
         return -1;
     }
     
@@ -108,3 +122,4 @@ int delNDS(redisDb *db, robj *key) {
     
     return !rv;
 }
+

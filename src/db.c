@@ -468,11 +468,6 @@ void moveCommand(redisClient *c) {
         return;
     }
 
-#ifdef USE_NDS
-    addReplyError(c,"MOVE is not allowed while using NDS");
-    return;
-#endif
-
     /* Obtain source and target DB pointers */
     src = c->db;
     srcid = c->db->id;

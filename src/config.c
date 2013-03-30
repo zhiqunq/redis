@@ -193,17 +193,10 @@ void loadServerConfigFromString(char *config) {
                 goto loaderr;
             }
         } else if (!strcasecmp(argv[0],"databases") && argc == 2) {
-#ifdef USE_NDS
-            /* NDS only supports one database, which we've already
-             * set as the default elsewhere
-             */
-            redisLog(REDIS_WARNING, "NDS in use: value of 'databases' config parameter ignored");
-#else
             server.dbnum = atoi(argv[1]);
             if (server.dbnum < 1) {
                 err = "Invalid number of databases"; goto loaderr;
             }
-#endif
         } else if (!strcasecmp(argv[0],"include") && argc == 2) {
             loadServerConfig(argv[1],NULL);
         } else if (!strcasecmp(argv[0],"maxclients") && argc == 2) {

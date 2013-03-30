@@ -45,11 +45,6 @@ to anyone:
   with a special flag enabled.  It'd be nice to be able to turn NDS on at
   runtime.  This shouldn't be spectacularly hard to do.
 
-* No multi-database support.  Personally, I think that running multi-database
-  is a dumb idea anyway (Redises are cheap), but if you use multi-database,
-  then NDS isn't for you.  Moving to a GDBM file-per-database would probably
-  be the best thing to do.
-
 * Async flushing.  If you're happy with potentially losing a small amount of
   data in the event of a crash, it would be delightful to be able to flush
   dirty keys out to the GDBM file periodically, rather than the synchronous

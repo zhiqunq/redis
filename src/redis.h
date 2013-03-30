@@ -72,11 +72,7 @@
 #define REDIS_MAX_HZ            500 
 #define REDIS_SERVERPORT        6379    /* TCP port */
 #define REDIS_MAXIDLETIME       0       /* default client timeout: infinite */
-#ifdef USE_NDS
-  #define REDIS_DEFAULT_DBNUM   1
-#else
-  #define REDIS_DEFAULT_DBNUM   16
-#endif
+#define REDIS_DEFAULT_DBNUM     16
 #define REDIS_CONFIGLINE_MAX    1024
 #define REDIS_EXPIRELOOKUPS_PER_CRON    10 /* lookup 10 expires per loop */
 #define REDIS_EXPIRELOOKUPS_TIME_PERC   25 /* CPU max % for keys collection */
