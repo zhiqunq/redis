@@ -32,6 +32,10 @@
 #include <signal.h>
 #include <ctype.h>
 
+#ifdef USE_NDS
+  #include "nds.h"
+#endif
+
 void slotToKeyAdd(robj *key);
 void slotToKeyDel(robj *key);
 void slotToKeyFlush(void);
@@ -41,10 +45,32 @@ void slotToKeyFlush(void);
  *----------------------------------------------------------------------------*/
 
 robj *lookupKey(redisDb *db, robj *key) {
+    robj *val = NULL;
     dictEntry *de = dictFind(db->dict,key->ptr);
-    if (de) {
-        robj *val = dictGetVal(de);
 
+    if (de) {
+        val = dictGetVal(de);
+    }
+
+#ifdef USE_NDS
+    if (!de) {
+    	robj *obj = getNDS(db, key);
+    	
+    	if (obj) {
+    	    /* It would be neat to be able to use dbAdd here, but we'd end
+    	     * up with an unnecessary write to the DB if we did, because
+    	     * we're hooking into dbAdd to write keys to the DB.
+    	     */
+            sds copy = sdsdup(key->ptr);
+            int retval = dictAdd(db->dict, copy, val);
+
+            redisAssertWithInfo(NULL,key,retval == REDIS_OK);
+        }
+        val = obj;
+    }
+#endif
+    
+    if (val) {
         /* Update the access time for the ageing algorithm.
          * Don't do it if we have a saving child, as this will trigger
          * a copy on write madness. */
@@ -94,6 +120,9 @@ void dbAdd(redisDb *db, robj *key, robj *val) {
     int retval = dictAdd(db->dict, copy, val);
 
     redisAssertWithInfo(NULL,key,retval == REDIS_OK);
+#ifdef USE_NDS
+    setNDS(db, key, val);
+#endif
     if (server.cluster_enabled) slotToKeyAdd(key);
  }
 
@@ -106,6 +135,9 @@ void dbOverwrite(redisDb *db, robj *key, robj *val) {
     struct dictEntry *de = dictFind(db->dict,key->ptr);
     
     redisAssertWithInfo(NULL,key,de != NULL);
+#ifdef USE_NDS
+    setNDS(db, key, val);
+#endif
     dictReplace(db->dict, key->ptr, val);
 }
 
@@ -158,11 +190,22 @@ robj *dbRandomKey(redisDb *db) {
 
 /* Delete a key, value, and associated expiration entry if any, from the DB */
 int dbDelete(redisDb *db, robj *key) {
+    int delcount = 0;
+    
     /* Deleting an entry from the expires dict will not free the sds of
      * the key, because it is shared with the main dictionary. */
     if (dictSize(db->expires) > 0) dictDelete(db->expires,key->ptr);
+#ifdef USE_NDS
+    if (delNDS(db, key) == 1) {
+        delcount++;
+    }
+#endif
     if (dictDelete(db->dict,key->ptr) == DICT_OK) {
         if (server.cluster_enabled) slotToKeyDel(key);
+        delcount++;
+    }
+    
+    if (delcount > 0) {
         return 1;
     } else {
         return 0;
@@ -199,6 +242,9 @@ int selectDb(redisClient *c, int id) {
  *----------------------------------------------------------------------------*/
 
 void signalModifiedKey(redisDb *db, robj *key) {
+#ifdef USE_NDS
+    setNDS(db, key, lookupKey(db, key));
+#endif
     touchWatchedKey(db,key);
 }
 
@@ -421,6 +467,11 @@ void moveCommand(redisClient *c) {
         addReplyError(c,"MOVE is not allowed in cluster mode");
         return;
     }
+
+#ifdef USE_NDS
+    addReplyError(c,"MOVE is not allowed while using NDS");
+    return;
+#endif
 
     /* Obtain source and target DB pointers */
     src = c->db;

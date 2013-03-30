@@ -1097,6 +1097,13 @@ int rdbLoad(char *filename) {
         if (!(loops++ % 1000)) {
             loadingProgress(rioTell(&rdb));
             aeProcessEvents(server.el, AE_FILE_EVENTS|AE_DONT_WAIT);
+#ifdef USE_NDS
+            /* When NDS is running, it is perfectly reasonable to be flushing
+             * keys from memory during the RDB load, because they're being
+             * stored in the freezer.
+             */
+            freeMemoryIfNeeded();
+#endif
         }
 
         /* Read type. */
