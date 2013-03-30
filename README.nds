@@ -64,3 +64,8 @@ to anyone:
   modifying the data dumper/loader to include setting the TTL (as is done in
   full RDB files, probably).  I'll likely leave this for someone who uses
   TTLs on their keys.
+
+* Allow GDBM operations to be non-blocking.  Probably not worth it for a
+  simple read or write operation, but if we've got async flushing and the
+  file can be locked for a long period, it'd be nice to have operations
+  waiting on the lock just go back into the event queue for later.
