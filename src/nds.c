@@ -14,7 +14,7 @@ void freezer_filename(redisDb *db, char *buf) {
 robj *getNDS(redisDb *db, robj *key) {
     /* Perhaps it's in the freezer... */
     char freezer_file[FREEZER_FILENAME_LEN];
-    GDBM_FILE freezer;
+    GDBM_FILE freezer = NULL;
     datum frz_key, frz_val;
     rio payload;
     int type;
@@ -22,10 +22,12 @@ robj *getNDS(redisDb *db, robj *key) {
     
     redisLog(REDIS_DEBUG, "Looking up %s in NDS", (char *)key->ptr);
     freezer_filename(db, freezer_file);
-    freezer = gdbm_open(freezer_file, 0, GDBM_READER, 0640, NULL);
-    if (!freezer) {
-        redisLog(REDIS_WARNING, "Could not open %s: %s", freezer_file, gdbm_strerror(gdbm_errno));
-        return NULL;
+    while (!freezer) {
+        freezer = gdbm_open(freezer_file, 0, GDBM_READER, 0640, NULL);
+        if (!freezer && gdbm_errno != GDBM_CANT_BE_READER) {
+            redisLog(REDIS_WARNING, "Could not open %s: %s", freezer_file, gdbm_strerror(gdbm_errno));
+            return NULL;
+        }
     }
     
     frz_key.dptr  = (char *)key->ptr;
@@ -61,7 +63,7 @@ nds_cleanup:
 
 void setNDS(redisDb *db, robj *key, robj *val) {
     char freezer_file[FREEZER_FILENAME_LEN];
-    GDBM_FILE freezer;
+    GDBM_FILE freezer = NULL;
     datum frz_key, frz_val;
     rio payload;
     
@@ -76,10 +78,12 @@ void setNDS(redisDb *db, robj *key, robj *val) {
         
     redisLog(REDIS_DEBUG, "Writing %s to NDS", (char *)key->ptr);
     freezer_filename(db, freezer_file);
-    freezer = gdbm_open(freezer_file, 0, GDBM_WRCREAT, 0640, NULL);
-    if (!freezer) {
-        redisLog(REDIS_WARNING, "Could not open %s: %s", freezer_file, gdbm_strerror(gdbm_errno));
-        return;
+    while (!freezer) {
+        freezer = gdbm_open(freezer_file, 0, GDBM_WRCREAT, 0640, NULL);
+        if (!freezer && gdbm_errno != GDBM_CANT_BE_WRITER) {
+            redisLog(REDIS_WARNING, "Could not open %s: %s", freezer_file, gdbm_strerror(gdbm_errno));
+            return;
+        }
     }
         
     frz_key.dptr  = (char *)key->ptr;
@@ -99,16 +103,18 @@ void setNDS(redisDb *db, robj *key, robj *val) {
  */
 int delNDS(redisDb *db, robj *key) {
     char freezer_file[FREEZER_FILENAME_LEN];
-    GDBM_FILE freezer;
+    GDBM_FILE freezer = NULL;
     datum frz_key;
     int rv;
     
     redisLog(REDIS_DEBUG, "Deleting %s from NDS", (char *)key->ptr);
     freezer_filename(db, freezer_file);
-    freezer = gdbm_open(freezer_file, 0, GDBM_WRCREAT, 0640, NULL);
-    if (!freezer) {
-        redisLog(REDIS_WARNING, "Could not open %s: %s", freezer_file, gdbm_strerror(gdbm_errno));
-        return -1;
+    while (!freezer) {
+        freezer = gdbm_open(freezer_file, 0, GDBM_WRCREAT, 0640, NULL);
+        if (!freezer && gdbm_errno != GDBM_CANT_BE_WRITER) {
+            redisLog(REDIS_WARNING, "Could not open %s: %s", freezer_file, gdbm_strerror(gdbm_errno));
+            return -1;
+        }
     }
     
     frz_key.dptr  = (char *)key->ptr;
@@ -122,4 +128,3 @@ int delNDS(redisDb *db, robj *key) {
     
     return !rv;
 }
-
