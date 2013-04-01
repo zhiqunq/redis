@@ -31,6 +31,10 @@
 #include "slowlog.h"
 #include "bio.h"
 
+#ifdef USE_NDS
+  #include "nds.h"
+#endif
+
 #include <time.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -996,7 +1000,11 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     }
 
     /* Check if a background saving or AOF rewrite in progress terminated. */
-    if (server.rdb_child_pid != -1 || server.aof_child_pid != -1) {
+    if (server.rdb_child_pid != -1 || server.aof_child_pid != -1
+#ifdef USE_NDS
+        || server.nds_child_pid != -1
+#endif
+       ) {
         int statloc;
         pid_t pid;
 
@@ -1004,18 +1012,28 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
             int exitcode = WEXITSTATUS(statloc);
             int bysignal = 0;
             
+            if (pid == -1) {
+                redisLog(REDIS_WARNING, "wait3() failed: %s", strerror(errno));
+            }
+
             if (WIFSIGNALED(statloc)) bysignal = WTERMSIG(statloc);
 
-            if (pid == server.rdb_child_pid) {
-                backgroundSaveDoneHandler(exitcode,bysignal);
-            } else if (pid == server.aof_child_pid) {
-                backgroundRewriteDoneHandler(exitcode,bysignal);
-            } else {
-                redisLog(REDIS_WARNING,
-                    "Warning, detected child with unmatched pid: %ld",
-                    (long)pid);
+            if (pid > 0) {
+                if (pid == server.rdb_child_pid) {
+                    backgroundSaveDoneHandler(exitcode,bysignal);
+                } else if (pid == server.aof_child_pid) {
+                    backgroundRewriteDoneHandler(exitcode,bysignal);
+#ifdef USE_NDS
+                } else if (pid == server.nds_child_pid) {
+                    backgroundNDSFlushDoneHandler(exitcode,bysignal);
+#endif
+                } else {
+                    redisLog(REDIS_WARNING,
+                        "Warning, detected child with unmatched pid: %ld",
+                        (long)pid);
+                }
+                updateDictResizePolicy();
             }
-            updateDictResizePolicy();
         }
     } else {
         /* If there is not a background saving/rewrite in progress check if
@@ -1027,7 +1045,12 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
                 server.unixtime-server.lastsave > sp->seconds) {
                 redisLog(REDIS_NOTICE,"%d changes in %d seconds. Saving...",
                     sp->changes, (int)sp->seconds);
+#ifdef USE_NDS
+                /* RDB saving is pointless if we've got NDS */
+                backgroundDirtyKeysFlush();
+#else
                 rdbSaveBackground(server.rdb_filename);
+#endif
                 break;
             }
          }
@@ -1426,6 +1449,10 @@ void initServer() {
         server.db[j].blocking_keys = dictCreate(&keylistDictType,NULL);
         server.db[j].ready_keys = dictCreate(&setDictType,NULL);
         server.db[j].watched_keys = dictCreate(&keylistDictType,NULL);
+#ifdef USE_NDS
+        server.db[j].dirty_keys = dictCreate(&keyptrDictType, NULL);
+        server.db[j].flushing_keys = dictCreate(&keyptrDictType, NULL);
+#endif
         server.db[j].id = j;
     }
     server.pubsub_channels = dictCreate(&keylistDictType,NULL);
@@ -1435,6 +1462,9 @@ void initServer() {
     server.cronloops = 0;
     server.rdb_child_pid = -1;
     server.aof_child_pid = -1;
+#ifdef USE_NDS
+    server.nds_child_pid = -1;
+#endif
     aofRewriteBufferReset();
     server.aof_buf = sdsempty();
     server.lastsave = time(NULL);
@@ -1890,6 +1920,10 @@ int prepareForShutdown(int flags) {
         redisLog(REDIS_NOTICE,"Calling fsync() on the AOF file.");
         aof_fsync(server.aof_fd);
     }
+#ifdef USE_NDS
+    redisLog(REDIS_NOTICE, "Flushing dirty keys to NDS before exiting.");
+    flushDirtyKeys();
+#endif
     if ((server.saveparamslen > 0 && !nosave) || save) {
         redisLog(REDIS_NOTICE,"Saving the final RDB snapshot before exiting.");
         /* Snapshotting. Perform a SYNC SAVE and exit */
@@ -2474,6 +2508,18 @@ int freeMemoryIfNeeded(void) {
     if (server.maxmemory_policy == REDIS_MAXMEMORY_NO_EVICTION)
         return REDIS_ERR; /* We need to free memory, but policy forbids. */
 
+#ifdef USE_NDS
+    /* Trigger a flush of dirty keys if one isn't already in progress; we
+     * may be able to free enough memory without it, but it won't hurt to
+     * keep the dirty key list minimal anyway if we're under memory
+     * pressure.  Note that this is a *background* flush; chances are it
+     * won't finish quick enough to be of use in *this* memory freeing
+     * round, but it'll certainly help in the future. */
+    if (server.nds_child_pid == -1) {
+        backgroundDirtyKeysFlush();
+    }
+#endif
+
     /* Compute how much memory we need to free. */
     mem_tofree = mem_used - server.maxmemory;
     mem_freed = 0;
@@ -2549,8 +2595,13 @@ int freeMemoryIfNeeded(void) {
                 }
             }
 
-            /* Finally remove the selected key. */
+            /* Finally remove the selected key, (as long as it isn't dirty, if
+             * we're using NDS) */
+#ifdef USE_NDS
+            if (bestkey && !isDirtyKey(db, bestkey)) {
+#else
             if (bestkey) {
+#endif
                 long long delta;
 
                 robj *keyobj = createStringObject(bestkey,sdslen(bestkey));

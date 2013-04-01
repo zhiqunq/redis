@@ -35,6 +35,15 @@ Build with USE_NDS=yes:
 The resulting redis-server binary will store all its data in your data
 directory, in freezer.gdbm.
 
+If you'd like to run up an NDS-enabled Redis instance from an existing RDB
+(or AOF), that's pretty simple: just start up the NDS-enabled redis instance
+with the AOF or RDB in the usual place.  This will take a long time (writing
+all that data to GDBM takes a while), but once that's done you'll never have
+to do it again.  You can now delete the AOF or RDB (and disable those
+features).  From now on, when you start up, your data will come from the NDS
+"freezer".
+
+
 TODO
 
 NDS is very new, and shouldn't be relied upon for anything really important. 
@@ -45,27 +54,30 @@ to anyone:
   with a special flag enabled.  It'd be nice to be able to turn NDS on at
   runtime.  This shouldn't be spectacularly hard to do.
 
-* Async flushing.  If you're happy with potentially losing a small amount of
-  data in the event of a crash, it would be delightful to be able to flush
-  dirty keys out to the GDBM file periodically, rather than the synchronous
-  writing.  That would return Redis itself to close to its current
-  performance level, while still having nearly-real-time persistence.
-  
 * Stats.  It'd be nice to get cache hit rates, read and write counts, and
   all that sort of good stuff out of redis.
 
-* A better data file format.  GDBM isn't amazingly quick, and most
-  importantly it doesn't allow writes while someone's reading.  This isn't a
-  huge problem now, but when we start periodically flushing, fetching keys
-  from disk will stall while dirty keys are flushed.  This is kinda bad.  An
-  append-only format, like AODBM, would be almost ideal.
+* A better data file format.  GDBM isn't amazingly quick, it only allows for
+  synchronous operations, and readers and writers can't coexist (a potential
+  problem when we're trying to read out of the file while a large flush is
+  going on).  The combination of the second and third points are the killer
+  -- I wouldn't care so much that we only allow one writer *or* N readers if
+  all DB ops were async (and preferably opaque to redis itself).  Async
+  ops to disk would of course be awesome from a throughput and average
+  latency perspective.
 
 * Keys lose their TTLs when they get stashed.  This presumably just involves
   modifying the data dumper/loader to include setting the TTL (as is done in
   full RDB files, probably).  I'll likely leave this for someone who uses
   TTLs on their keys.
 
-* Allow GDBM operations to be non-blocking.  Probably not worth it for a
-  simple read or write operation, but if we've got async flushing and the
-  file can be locked for a long period, it'd be nice to have operations
-  waiting on the lock just go back into the event queue for later.
+* Allow freezer operations to be non-blocking.  Probably not worth it for a
+  simple read or write operation, but if we've got longer-running operations
+  against the disk, it'd be nice to have those calls just go back into the
+  event queue for later.
+
+* 'keys', at present, will only work on the keys that are in-memory, and
+  will completely disavow all knowledge of all the keys that are *only* in
+  the freezer.  Personally, I don't think this is a huge deal -- using
+  'keys' is a great way to totally wedge your redis -- but it'll need fixing
+  if anyone actually wants 'keys' to be useful.  I expect this'll 

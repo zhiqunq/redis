@@ -62,7 +62,7 @@ robj *lookupKey(redisDb *db, robj *key) {
     	     * we're hooking into dbAdd to write keys to the DB.
     	     */
             sds copy = sdsdup(key->ptr);
-            int retval = dictAdd(db->dict, copy, val);
+            int retval = dictAdd(db->dict, copy, obj);
 
             redisAssertWithInfo(NULL,key,retval == REDIS_OK);
         }
@@ -121,7 +121,7 @@ void dbAdd(redisDb *db, robj *key, robj *val) {
 
     redisAssertWithInfo(NULL,key,retval == REDIS_OK);
 #ifdef USE_NDS
-    setNDS(db, key, val);
+    touchDirtyKey(db, key->ptr);
 #endif
     if (server.cluster_enabled) slotToKeyAdd(key);
  }
@@ -136,7 +136,7 @@ void dbOverwrite(redisDb *db, robj *key, robj *val) {
     
     redisAssertWithInfo(NULL,key,de != NULL);
 #ifdef USE_NDS
-    setNDS(db, key, val);
+    touchDirtyKey(db, key->ptr);
 #endif
     dictReplace(db->dict, key->ptr, val);
 }
@@ -196,6 +196,10 @@ int dbDelete(redisDb *db, robj *key) {
      * the key, because it is shared with the main dictionary. */
     if (dictSize(db->expires) > 0) dictDelete(db->expires,key->ptr);
 #ifdef USE_NDS
+    /* Deletion needs to be flushed to disk immediately, otherwise the
+     * previously stored value of the key could be retrieved from the
+     * freezer if it is asked for in the future.
+     */
     if (delNDS(db, key) == 1) {
         delcount++;
     }
@@ -243,7 +247,7 @@ int selectDb(redisClient *c, int id) {
 
 void signalModifiedKey(redisDb *db, robj *key) {
 #ifdef USE_NDS
-    setNDS(db, key, lookupKey(db, key));
+    touchDirtyKey(db, key->ptr);
 #endif
     touchWatchedKey(db,key);
 }

@@ -356,6 +356,10 @@ typedef struct redisDb {
     dict *blocking_keys;        /* Keys with clients waiting for data (BLPOP) */
     dict *ready_keys;           /* Blocked keys that received a PUSH */
     dict *watched_keys;         /* WATCHED keys for MULTI/EXEC CAS */
+#ifdef USE_NDS
+    dict *dirty_keys;           /* Keys that have been changed but not yet flushed */
+    dict *flushing_keys;        /* Keys being flushed by a child at the moment */
+#endif
     int id;
 } redisDb;
 
@@ -767,6 +771,10 @@ struct redisServer {
     time_t rdb_save_time_start;     /* Current RDB save start time. */
     int lastbgsave_status;          /* REDIS_OK or REDIS_ERR */
     int stop_writes_on_bgsave_err;  /* Don't allow writes if can't BGSAVE */
+#ifdef USE_NDS
+    /* NDS persistence */
+    pid_t nds_child_pid;            /* PID of child flushing to NDS */
+#endif
     /* Propagation of commands in AOF / replication */
     redisOpArray also_propagate;    /* Additional command to propagate. */
     /* Logging */

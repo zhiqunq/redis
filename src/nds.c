@@ -128,3 +128,126 @@ int delNDS(redisDb *db, robj *key) {
     
     return !rv;
 }
+
+/* Add the key to the dirty keys list if it isn't there already */
+void touchDirtyKey(redisDb *db, sds sdskey) {
+    sds copy = sdsdup(sdskey);
+    dictEntry *de = dictFind(db->dirty_keys, copy);
+    
+    if (!de) {
+        dictAdd(db->dirty_keys, copy, NULL);
+    }
+}
+
+int isDirtyKey(redisDb *db, sds sdskey) {
+    dictEntry *de = dictFind(db->dirty_keys, sdskey);
+    
+    if (de) {
+        return 1;
+    }
+    
+    de = dictFind(db->flushing_keys, sdskey);
+    
+    if (de) {
+        return 1;
+    }
+    
+    return 0;
+}
+    
+/* Fork and flush all the dirty keys out to disk. */
+int backgroundDirtyKeysFlush() {
+    pid_t childpid;
+    
+    if (server.nds_child_pid != -1) return REDIS_ERR;
+    
+    server.dirty_before_bgsave = server.dirty;
+
+    if ((childpid = fork()) == 0) {
+        int retval;
+        
+        /* Child */
+        if (server.ipfd > 0) close(server.ipfd);
+        if (server.sofd > 0) close(server.sofd);
+        
+        redisSetProcTitle("redis-nds-flush");
+        
+        retval = flushDirtyKeys();
+        
+        exitFromChild((retval == REDIS_OK) ? 0 : 1);
+    } else {
+        /* Parent */
+        if (childpid == -1) {
+            redisLog(REDIS_WARNING, "Can't save in background: fork: %s",
+                     strerror(errno));
+            return REDIS_ERR;
+        }
+        
+        redisLog(REDIS_NOTICE, "Dirty key flush started in PID %d", childpid);
+        server.nds_child_pid = childpid;
+        /* Rotate the dirty keys into the flushing keys list, and use the
+         * previous flushing keys list as the new dirty keys list. */
+        for (int j = 0; j < server.dbnum; j++) {
+            redisDb *db = server.db+j;
+            dict *dTmp;
+            dTmp = db->flushing_keys;
+            db->flushing_keys = db->dirty_keys;
+            db->dirty_keys = dTmp;
+            dictEmpty(db->dirty_keys);
+        }
+        return REDIS_OK;
+    }
+    
+    /* Can't happen */
+    return REDIS_ERR;
+}
+
+int flushDirtyKeys() {
+    for (int j = 0; j < server.dbnum; j++) {
+        redisDb *db = server.db+j;
+        dictIterator *di;
+        dictEntry *deKey, *deVal;
+        robj roKey;
+        
+        if (dictSize(db->dirty_keys) == 0) continue;
+        
+        di = dictGetSafeIterator(db->dirty_keys);
+        if (!di) {
+            return REDIS_ERR;
+        }
+        
+        while ((deKey = dictNext(di)) != NULL) {
+            sds keystr = dictGetKey(deKey);
+            redisLog(REDIS_DEBUG, "Flushing key '%s' to NDS", keystr);
+            deVal = dictFind(db->dict, keystr);
+            if (!deVal) {
+                /* Key must have been deleted after it got dirtied.  That's
+                 * easy to handle -- it's already been deleted from the
+                 * freezer, so we just ignore it now and everything goes
+                 * away. */
+                redisLog(REDIS_DEBUG, "Key '%s' was deleted; not saving", keystr);
+                sdsfree(keystr);
+                continue;
+            }
+            
+            roKey.ptr = keystr;
+            setNDS(db, &roKey, dictGetVal(deVal));
+            sdsfree(keystr);
+        }
+    }
+    
+    server.dirty = 0;
+    
+    return REDIS_OK;
+}
+
+void backgroundNDSFlushDoneHandler(int exitcode, int bysignal) {
+    redisLog(REDIS_NOTICE, "NDS background save completed.  exitcode=%i, bysignal=%i", exitcode, bysignal);
+    for (int j = 0; j < server.dbnum; j++) {
+        redisDb *db = server.db+j;
+        dictEmpty(db->flushing_keys);
+    }
+    server.lastsave = time(NULL);
+    server.nds_child_pid = -1;
+    server.dirty -= server.dirty_before_bgsave;
+}
