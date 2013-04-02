@@ -1127,22 +1127,22 @@ int rdbLoad(char *filename) {
             }
             
             /* It's worth flushing to NDS periodically, to allow memory usage
-             * to stay under control */
+             * to stay under control. */
             if (server.nds_child_pid == -1) {
                 backgroundDirtyKeysFlush();
             }
-            
+
             /* When NDS is running, it is perfectly reasonable to be flushing
              * keys from memory during the RDB load, because they've been stored
              * in the freezer already anyway.
              */
             retval = freeMemoryIfNeeded();
-            
+
             /* We'd prefer it if we didn't exceed the memory limit of the instance
              * during the load process; thus, if freeMemoryIfNeeded() wasn't able
              * to clear enough memory, let's just go around and around in circles until
              * we *are* able to free memory. */
-            if (!retval) {
+            if (retval == REDIS_ERR) {
                 /* If we don't set this back to something that % 1000 == 0,
                  * then we won't end up in here on the next iteration, which
                  * is somewhat pointless */
