@@ -111,7 +111,7 @@ REDIS_CHECK_AOF_OBJ= redis-check-aof.o
 
 ifeq ($(USE_NDS),yes)
   FINAL_CFLAGS+= -DUSE_NDS
-  FINAL_LIBS+= -lgdbm
+  FINAL_LIBS+= -lleveldb
   REDIS_SERVER_OBJ+= nds.o
 endif
 
