@@ -2480,6 +2480,9 @@ int freeMemoryIfNeeded(void) {
     size_t mem_used, mem_tofree, mem_freed;
     int slaves = listLength(server.slaves);
 
+    /* 0 == "no limit", so that's easy */
+    if (server.maxmemory == 0) return REDIS_OK;
+
     /* Remove the size of slaves output buffers and AOF buffer from the
      * count of used memory. */
     mem_used = zmalloc_used_memory();
@@ -2508,21 +2511,10 @@ int freeMemoryIfNeeded(void) {
     if (server.maxmemory_policy == REDIS_MAXMEMORY_NO_EVICTION)
         return REDIS_ERR; /* We need to free memory, but policy forbids. */
 
-#ifdef USE_NDS
-    /* Trigger a flush of dirty keys if one isn't already in progress; we
-     * may be able to free enough memory without it, but it won't hurt to
-     * keep the dirty key list minimal anyway if we're under memory
-     * pressure.  Note that this is a *background* flush; chances are it
-     * won't finish quick enough to be of use in *this* memory freeing
-     * round, but it'll certainly help in the future. */
-    if (server.nds_child_pid == -1) {
-        backgroundDirtyKeysFlush();
-    }
-#endif
-
     /* Compute how much memory we need to free. */
     mem_tofree = mem_used - server.maxmemory;
     mem_freed = 0;
+
     while (mem_freed < mem_tofree) {
         int j, k, keys_freed = 0;
 
@@ -2615,7 +2607,14 @@ int freeMemoryIfNeeded(void) {
                  * AOF and Output buffer memory will be freed eventually so
                  * we only care about memory used by the key space. */
                 delta = (long long) zmalloc_used_memory();
+#ifdef USE_NDS
+                /* dbDelete nukes the key from NDS, which is quite particularly
+                 * not what we want.  So we do it by hand. */
+                if (dictSize(db->expires) > 0) dictDelete(db->expires,keyobj->ptr);
+                dictDelete(db->dict,keyobj->ptr);
+#else
                 dbDelete(db,keyobj);
+#endif
                 delta -= (long long) zmalloc_used_memory();
                 mem_freed += delta;
                 server.stat_evictedkeys++;
