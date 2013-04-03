@@ -1046,6 +1046,9 @@ void startLoading(FILE *fp) {
     } else {
         server.loading_total_bytes = sb.st_size;
     }
+#ifdef USE_NDS
+    nukeNDSFromOrbit();
+#endif
 }
 
 /* Refresh the loading progress info */
