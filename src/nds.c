@@ -1,7 +1,7 @@
 #include "redis.h"
 #include "nds.h"
 
-#include <leveldb/c.h>
+#include <kclangc.h>
 
 #include <stdio.h>
 
@@ -10,131 +10,118 @@
 /* Generate the name of the freezer we want, based on the database passed
  * in, and stuff the name into buf */
 static void freezer_filename(redisDb *db, char *buf) {
-    snprintf(buf, FREEZER_FILENAME_LEN-1, "freezer_%i", db->id);
+    snprintf(buf, FREEZER_FILENAME_LEN-1, "freezer_%i.kch", db->id);
 }
 
-/* Hide the insane troll logic required to open a leveldb.  Pass in the
- * redis DB to open the freezer for, and pass back a leveldb_t ready for
- * use.  Return NULL on failure (errors will be reported via redisLog).  */
-static leveldb_t *nds_open(redisDb *db) {
-    leveldb_options_t *opts = leveldb_options_create();
-    char *err = NULL, freezer_name[FREEZER_FILENAME_LEN];
-    leveldb_t *ldb;
-    
-    leveldb_options_set_create_if_missing(opts, 't');
+/* Open the freezer.  Pass in the redis DB to open the freezer for and
+ * whether you want to open for read (writer == 0) or write (writer == 1). 
+ * You'll get back a KCDB * ready for use, or NULL on permanent failure
+ * (errors will be reported via redisLog).  */
+static KCDB *nds_open(redisDb *db, int writer) {
+    char freezer_name[FREEZER_FILENAME_LEN];
+    KCDB *kcdb;
     
     freezer_filename(db, freezer_name);
     
-    ldb = leveldb_open(opts, freezer_name, &err);
+    kcdb = kcdbnew();
+    if (!kcdb) {
+        goto err_cleanup;
+    }
     
-    while (err) {
-        redisLog(REDIS_WARNING, "Failed to open the freezer: %s", err);
-        free(err);
-        ldb = NULL;
-        if (errno == EAGAIN) {
-            ldb = leveldb_open(opts, freezer_name, &err);
-        } else {
-            goto cleanup;
+    if (!kcdbopen(kcdb, freezer_name, (writer ? KCOWRITER : KCOREADER) | KCOCREATE)) {
+        redisLog(REDIS_WARNING, "Failed to open the freezer: %s", kcecodename(kcdbecode(kcdb)));
+        goto err_cleanup;
+    }
+
+    /* Epic win! */
+    goto done;
+
+err_cleanup:
+    if (kcdb) {
+        kcdbdel(kcdb);
+    }
+done:
+    return kcdb;    
+}
+
+/* Close an NDS database. */
+static void nds_close(KCDB *kcdb) {
+    if (kcdb) {
+        if (!kcdbclose(kcdb)) {
+            redisLog(REDIS_WARNING, "Failed to close the freezer: %s", kcecodename(kcdbecode(kcdb)));
         }
-    }
-    
-cleanup:
-    leveldb_options_destroy(opts);
-    return ldb;    
-}
-
-/* Close a leveldb database.  No insane troll logic to be found, it's just
- * nice to have a consistent API. */
-static void nds_close(leveldb_t *ldb) {
-    if (ldb) {
-        leveldb_close(ldb);
+        kcdbdel(kcdb);
     }
 }
 
-/* Hide the insane troll logic required to get a value out of a leveldb. 
- * Pass in the DB and key to get the value for, and return an sds containing
- * the value if found, or NULL on error or key-not-found.  Will report
- * errors via redisLog.  */
+/* Get a value out of the NDS.  Pass in the DB and key to get the value for,
+ * and return an sds containing the value if found, or NULL on error or
+ * key-not-found.  Will report errors via redisLog.  */
 static sds nds_get(redisDb *db, sds key) {
-    leveldb_readoptions_t *opts = leveldb_readoptions_create();
-    leveldb_t *ldb = nds_open(db);
-    char *err = NULL, *valdata;
+    KCDB *kcdb = nds_open(db, 0);
+    char *valdata;
     size_t vallen;
     sds val = NULL;
 
-    if (!ldb) {
+    if (!kcdb) {
         goto cleanup;
     }
     
-    valdata = leveldb_get(ldb, opts, key, sdslen(key), &vallen, &err);
-    
-    if (err) {
-        redisLog(REDIS_ERR, "Error while attempting to get value of %s: %s", key, err);
-        free(err);
-        valdata = NULL;
-        goto cleanup;
-    }
+    valdata = kcdbget(kcdb, key, sdslen(key), &vallen);
     
     if (valdata) {
         val = sdsnewlen(valdata, vallen);
-        free(valdata);
+        kcfree(valdata);
     }
 
 cleanup:
-    nds_close(ldb);
-    leveldb_readoptions_destroy(opts);
+    nds_close(kcdb);
     return val;
 }
 
-/* Insane troll logic, put style.  Takes a redisDB, a key, and a value, and makes
+/* Put a valud into the NDS.  Takes a redisDB, a key, and a value, and makes
  * sure they get into the database (or you at least know what's going on via the
- * logs). */
-static void nds_put(redisDb *db, sds key, sds val) {
-    leveldb_writeoptions_t *opts = leveldb_writeoptions_create();
-    leveldb_t *ldb = nds_open(db);
-    char *err = NULL;
+ * logs). Returns 0 on failure or 1 on success. */
+static int nds_put(redisDb *db, sds key, sds val) {
+    KCDB *kcdb = nds_open(db, 1);
+    int rv = 1;
     
-    if (!ldb) {
+    if (!kcdb) {
+        rv = 0;
         goto cleanup;
     }
     
-    leveldb_put(ldb, opts, key, sdslen(key), val, sdslen(val), &err);
-    
-    if (err) {
-        redisLog(REDIS_ERR, "Failed to put %s: %s", key, err);
-        free(err);
+    if (!kcdbset(kcdb, key, sdslen(key), val, sdslen(val))) {
+        redisLog(REDIS_ERR, "Failed to put %s: %s", key, kcecodename(kcdbecode(kcdb)));
+        rv = 0;
         goto cleanup;
     }
 
 cleanup:
-    nds_close(ldb);
-    leveldb_writeoptions_destroy(opts);
+    nds_close(kcdb);
+    return rv;
 }
 
 /* Deletion time!  Takes a redisDB and a key, and make the key go away.  Tells the user
  * about problems via the logs, and returns -1 if an error occured. */
 static int nds_del(redisDb *db, sds key) {
-    leveldb_writeoptions_t *opts = leveldb_writeoptions_create();
-    leveldb_t *ldb = nds_open(db);
-    int rv = 0;
-    char *err = NULL;
+    KCDB *kcdb = nds_open(db, 1);
+    int rv = 1;
     
-    if (!ldb) {
-        goto cleanup;
-    }
-    
-    leveldb_delete(ldb, opts, key, sdslen(key), &err);
-    
-    if (err) {
-        redisLog(REDIS_ERR, "Failed to delete %s: %s", key, err);
-        free(err);
+    if (!kcdb) {
         rv = -1;
         goto cleanup;
     }
-
+    
+    if (!kcdbremove(kcdb, key, sdslen(key))) {
+        /* ROAR!  I can't distinguish between a failure and 'no record', so
+         * I'll just have to make a potentially-unwarranted assumption that
+         * no record was found. */
+        rv = 0;
+    }    
+    
 cleanup:
-    nds_close(ldb);
-    leveldb_writeoptions_destroy(opts);
+    nds_close(kcdb);
     return rv;
 }
 
@@ -142,38 +129,51 @@ cleanup:
  * written on success, or -1 on error.  If error, there are no guarantees of which
  * keys may or may not have been written. */
 static int nds_bulk_put(redisDb *db, sds *keys, sds *vals, int kcount) {
-    leveldb_writeoptions_t *opts = leveldb_writeoptions_create();
-    leveldb_writebatch_t *batch = leveldb_writebatch_create();
-    char *err = NULL;
-    leveldb_t *ldb;
+    KCDB *kcdb = NULL;
+    KCREC *recs = NULL;
     int rv = kcount;
     
-    for (int i = 0; i < kcount; i++) {
-        leveldb_writebatch_put(batch, keys[i], sdslen(keys[i]),
-                                      vals[i], sdslen(vals[i])
-                              );
-    }
-    
-    ldb = nds_open(db);
-    
-    if (!ldb) {
-        rv = kcount;
+    recs = zmalloc(sizeof(KCREC) * kcount);
+    if (!recs) {
+        redisLog(REDIS_WARNING, "nds_bulk_put: Failed to allocate recs");
         goto cleanup;
     }
-    leveldb_write(ldb, opts, batch, &err);
-
-    if (err) {
-        redisLog(REDIS_WARNING, "NDS batch write failed: %s", err);
+    
+    for (int i = 0; i < kcount; i++) {
+    	recs[i].key.buf    = keys[i];
+    	recs[i].key.size   = sdslen(keys[i]);
+    	recs[i].value.buf  = vals[i];
+    	recs[i].value.size = sdslen(vals[i]);
+    }
+    
+    kcdb = nds_open(db, 1);
+    
+    if (!kcdb) {
         rv = -1;
-        free(err);
+        goto cleanup;
+    }
+    if (kcdbsetbulk(kcdb, recs, kcount, 0) == -1) {
+        redisLog(REDIS_WARNING, "NDS batch write failed: %s", kcecodename(kcdbecode(kcdb)));
+        rv = -1;
         goto cleanup;
     }
     
 cleanup:
-    nds_close(ldb);
-    leveldb_writeoptions_destroy(opts);
-    leveldb_writebatch_destroy(batch);
+    if (kcdb) {
+        nds_close(kcdb);
+    }
+    if (recs) {
+        zfree(recs);
+    }
     return rv;
+}
+
+static void nds_nuke(redisDb *db) {
+    KCDB *kcdb = nds_open(db, 1);
+    
+    if (kcdb) kcdbclear(kcdb);
+    
+    nds_close(kcdb);
 }
 
 robj *getNDS(redisDb *db, robj *key) {
@@ -250,6 +250,17 @@ int delNDS(redisDb *db, robj *key) {
     }
 
     return rv;
+}
+
+/* Clear all NDS databases */
+void nukeNDSFromOrbit() {
+    redisDb *db;
+    
+    for (int i = 0; i < server.dbnum; i++) {
+        db = server.db+i;
+        
+        nds_nuke(db);
+    }
 }
 
 /* Add the key to the dirty keys list if it isn't there already */
@@ -337,7 +348,6 @@ int flushDirtyKeys() {
         sds *vals;
         int nkeys = dictSize(db->dirty_keys);
         int i = 0;
-        rio payload;
         
         if (nkeys == 0) continue;
 
