@@ -30,10 +30,7 @@
 #include "redis.h"
 #include "slowlog.h"
 #include "bio.h"
-
-#ifdef USE_NDS
-  #include "nds.h"
-#endif
+#include "nds.h"
 
 #include <time.h>
 #include <signal.h>
@@ -1000,10 +997,9 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     }
 
     /* Check if a background saving or AOF rewrite in progress terminated. */
-    if (server.rdb_child_pid != -1 || server.aof_child_pid != -1
-#ifdef USE_NDS
+    if (server.rdb_child_pid != -1
+        || server.aof_child_pid != -1
         || server.nds_child_pid != -1
-#endif
        ) {
         int statloc;
         pid_t pid;
@@ -1023,10 +1019,8 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
                     backgroundSaveDoneHandler(exitcode,bysignal);
                 } else if (pid == server.aof_child_pid) {
                     backgroundRewriteDoneHandler(exitcode,bysignal);
-#ifdef USE_NDS
                 } else if (pid == server.nds_child_pid) {
                     backgroundNDSFlushDoneHandler(exitcode,bysignal);
-#endif
                 } else {
                     redisLog(REDIS_WARNING,
                         "Warning, detected child with unmatched pid: %ld",
@@ -1045,12 +1039,12 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
                 server.unixtime-server.lastsave > sp->seconds) {
                 redisLog(REDIS_NOTICE,"%d changes in %d seconds. Saving...",
                     sp->changes, (int)sp->seconds);
-#ifdef USE_NDS
-                /* RDB saving is pointless if we've got NDS */
-                backgroundDirtyKeysFlush();
-#else
-                rdbSaveBackground(server.rdb_filename);
-#endif
+                /* RDB periodic dumps are redundant if we've got NDS */
+                if (server.nds) {
+                    backgroundDirtyKeysFlush();
+                } else {
+                    rdbSaveBackground(server.rdb_filename);
+                }
                 break;
             }
          }
@@ -1249,6 +1243,7 @@ void initServerConfig() {
     server.aof_fd = -1;
     server.aof_selected_db = -1; /* Make sure the first time will not match */
     server.aof_flush_postponed_start = 0;
+    server.nds = 0;
     server.pidfile = zstrdup("/var/run/redis.pid");
     server.rdb_filename = zstrdup("dump.rdb");
     server.aof_filename = zstrdup("appendonly.aof");
@@ -1449,10 +1444,8 @@ void initServer() {
         server.db[j].blocking_keys = dictCreate(&keylistDictType,NULL);
         server.db[j].ready_keys = dictCreate(&setDictType,NULL);
         server.db[j].watched_keys = dictCreate(&keylistDictType,NULL);
-#ifdef USE_NDS
         server.db[j].dirty_keys = dictCreate(&keyptrDictType, NULL);
         server.db[j].flushing_keys = dictCreate(&keyptrDictType, NULL);
-#endif
         server.db[j].id = j;
     }
     server.pubsub_channels = dictCreate(&keylistDictType,NULL);
@@ -1462,9 +1455,7 @@ void initServer() {
     server.cronloops = 0;
     server.rdb_child_pid = -1;
     server.aof_child_pid = -1;
-#ifdef USE_NDS
     server.nds_child_pid = -1;
-#endif
     aofRewriteBufferReset();
     server.aof_buf = sdsempty();
     server.lastsave = time(NULL);
@@ -1920,24 +1911,25 @@ int prepareForShutdown(int flags) {
         redisLog(REDIS_NOTICE,"Calling fsync() on the AOF file.");
         aof_fsync(server.aof_fd);
     }
-#ifdef USE_NDS
-    redisLog(REDIS_NOTICE, "Flushing dirty keys to NDS before exiting.");
-    flushDirtyKeys();
-#else
-    if ((server.saveparamslen > 0 && !nosave) || save) {
-        redisLog(REDIS_NOTICE,"Saving the final RDB snapshot before exiting.");
-        /* Snapshotting. Perform a SYNC SAVE and exit */
-        if (rdbSave(server.rdb_filename) != REDIS_OK) {
-            /* Ooops.. error saving! The best we can do is to continue
-             * operating. Note that if there was a background saving process,
-             * in the next cron() Redis will be notified that the background
-             * saving aborted, handling special stuff like slaves pending for
-             * synchronization... */
-            redisLog(REDIS_WARNING,"Error trying to save the DB, can't exit.");
-            return REDIS_ERR;
+    if (server.nds) {
+        redisLog(REDIS_NOTICE, "Flushing dirty keys to NDS before exiting.");
+        flushDirtyKeys();
+    } else {
+        if ((server.saveparamslen > 0 && !nosave) || save) {
+            redisLog(REDIS_NOTICE,"Saving the final RDB snapshot before exiting.");
+            /* Snapshotting. Perform a SYNC SAVE and exit */
+            if (rdbSave(server.rdb_filename) != REDIS_OK) {
+                /* Ooops.. error saving! The best we can do is to continue
+                 * operating. Note that if there was a background saving process,
+                 * in the next cron() Redis will be notified that the background
+                 * saving aborted, handling special stuff like slaves pending for
+                 * synchronization... */
+                redisLog(REDIS_WARNING,"Error trying to save the DB, can't exit.");
+                return REDIS_ERR;
+            }
         }
     }
-#endif
+
     if (server.daemonize) {
         redisLog(REDIS_NOTICE,"Removing the pid file.");
         unlink(server.pidfile);
@@ -2590,11 +2582,7 @@ int freeMemoryIfNeeded(void) {
 
             /* Finally remove the selected key, (as long as it isn't dirty, if
              * we're using NDS) */
-#ifdef USE_NDS
             if (bestkey && !isDirtyKey(db, bestkey)) {
-#else
-            if (bestkey) {
-#endif
                 long long delta;
 
                 robj *keyobj = createStringObject(bestkey,sdslen(bestkey));
@@ -2608,14 +2596,12 @@ int freeMemoryIfNeeded(void) {
                  * AOF and Output buffer memory will be freed eventually so
                  * we only care about memory used by the key space. */
                 delta = (long long) zmalloc_used_memory();
-#ifdef USE_NDS
+
                 /* dbDelete nukes the key from NDS, which is quite particularly
                  * not what we want.  So we do it by hand. */
                 if (dictSize(db->expires) > 0) dictDelete(db->expires,keyobj->ptr);
                 dictDelete(db->dict,keyobj->ptr);
-#else
-                dbDelete(db,keyobj);
-#endif
+
                 delta -= (long long) zmalloc_used_memory();
                 mem_freed += delta;
                 server.stat_evictedkeys++;
@@ -2778,23 +2764,23 @@ int checkForSentinelMode(int argc, char **argv) {
 
 /* Function called at startup to load RDB or AOF file in memory. */
 void loadDataFromDisk(void) {
-#ifdef USE_NDS
-    redisLog(REDIS_NOTICE, "Using data from NDS");
-#else
-    long long start = ustime();
-    if (server.aof_state == REDIS_AOF_ON) {
-        if (loadAppendOnlyFile(server.aof_filename) == REDIS_OK)
-            redisLog(REDIS_NOTICE,"DB loaded from append only file: %.3f seconds",(float)(ustime()-start)/1000000);
+    if (server.nds) {
+        redisLog(REDIS_NOTICE, "Using data from NDS");
     } else {
-        if (rdbLoad(server.rdb_filename) == REDIS_OK) {
-            redisLog(REDIS_NOTICE,"DB loaded from disk: %.3f seconds",
-                (float)(ustime()-start)/1000000);
-        } else if (errno != ENOENT) {
-            redisLog(REDIS_WARNING,"Fatal error loading the DB: %s. Exiting.",strerror(errno));
-            exit(1);
+        long long start = ustime();
+        if (server.aof_state == REDIS_AOF_ON) {
+            if (loadAppendOnlyFile(server.aof_filename) == REDIS_OK)
+                redisLog(REDIS_NOTICE,"DB loaded from append only file: %.3f seconds",(float)(ustime()-start)/1000000);
+        } else {
+            if (rdbLoad(server.rdb_filename) == REDIS_OK) {
+                redisLog(REDIS_NOTICE,"DB loaded from disk: %.3f seconds",
+                    (float)(ustime()-start)/1000000);
+            } else if (errno != ENOENT) {
+                redisLog(REDIS_WARNING,"Fatal error loading the DB: %s. Exiting.",strerror(errno));
+                exit(1);
+            }
         }
     }
-#endif
 }
 
 void redisOutOfMemoryHandler(size_t allocation_size) {

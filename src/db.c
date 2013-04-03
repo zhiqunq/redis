@@ -28,13 +28,10 @@
  */
 
 #include "redis.h"
+#include "nds.h"
 
 #include <signal.h>
 #include <ctype.h>
-
-#ifdef USE_NDS
-  #include "nds.h"
-#endif
 
 void slotToKeyAdd(robj *key);
 void slotToKeyDel(robj *key);
@@ -52,23 +49,23 @@ robj *lookupKey(redisDb *db, robj *key) {
         val = dictGetVal(de);
     }
 
-#ifdef USE_NDS
-    if (!de) {
-    	robj *obj = getNDS(db, key);
-    	
-    	if (obj) {
-    	    /* It would be neat to be able to use dbAdd here, but we'd end
-    	     * up with an unnecessary write to the DB if we did, because
-    	     * we're hooking into dbAdd to write keys to the DB.
-    	     */
-            sds copy = sdsdup(key->ptr);
-            int retval = dictAdd(db->dict, copy, obj);
+    if (server.nds) {
+        if (!de) {
+            robj *obj = getNDS(db, key);
+            
+            if (obj) {
+                /* It would be neat to be able to use dbAdd here, but we'd end
+                 * up with an unnecessary write to the DB if we did, because
+                 * we're hooking into dbAdd to write keys to the DB.
+                 */
+                sds copy = sdsdup(key->ptr);
+                int retval = dictAdd(db->dict, copy, obj);
 
-            redisAssertWithInfo(NULL,key,retval == REDIS_OK);
+                redisAssertWithInfo(NULL,key,retval == REDIS_OK);
+            }
+            val = obj;
         }
-        val = obj;
     }
-#endif
     
     if (val) {
         /* Update the access time for the ageing algorithm.
@@ -120,9 +117,9 @@ void dbAdd(redisDb *db, robj *key, robj *val) {
     int retval = dictAdd(db->dict, copy, val);
 
     redisAssertWithInfo(NULL,key,retval == REDIS_OK);
-#ifdef USE_NDS
-    touchDirtyKey(db, key->ptr);
-#endif
+    if (server.nds) {
+        touchDirtyKey(db, key->ptr);
+    }
     if (server.cluster_enabled) slotToKeyAdd(key);
  }
 
@@ -135,9 +132,9 @@ void dbOverwrite(redisDb *db, robj *key, robj *val) {
     struct dictEntry *de = dictFind(db->dict,key->ptr);
     
     redisAssertWithInfo(NULL,key,de != NULL);
-#ifdef USE_NDS
-    touchDirtyKey(db, key->ptr);
-#endif
+    if (server.nds) {
+        touchDirtyKey(db, key->ptr);
+    }
     dictReplace(db->dict, key->ptr, val);
 }
 
@@ -195,15 +192,15 @@ int dbDelete(redisDb *db, robj *key) {
     /* Deleting an entry from the expires dict will not free the sds of
      * the key, because it is shared with the main dictionary. */
     if (dictSize(db->expires) > 0) dictDelete(db->expires,key->ptr);
-#ifdef USE_NDS
+
     /* Deletion needs to be flushed to disk immediately, otherwise the
      * previously stored value of the key could be retrieved from the
      * freezer if it is asked for in the future.
      */
-    if (delNDS(db, key) == 1) {
+    if (server.nds && delNDS(db, key) == 1) {
         delcount++;
     }
-#endif
+
     if (dictDelete(db->dict,key->ptr) == DICT_OK) {
         if (server.cluster_enabled) slotToKeyDel(key);
         delcount++;
@@ -246,9 +243,9 @@ int selectDb(redisClient *c, int id) {
  *----------------------------------------------------------------------------*/
 
 void signalModifiedKey(redisDb *db, robj *key) {
-#ifdef USE_NDS
-    touchDirtyKey(db, key->ptr);
-#endif
+    if (server.nds) {
+        touchDirtyKey(db, key->ptr);
+    }
     touchWatchedKey(db,key);
 }
 
