@@ -57,24 +57,10 @@ to anyone:
 * Stats.  It'd be nice to get cache hit rates, read and write counts, and
   all that sort of good stuff out of redis.
 
-* A better data file format.  GDBM isn't amazingly quick, it only allows for
-  synchronous operations, and readers and writers can't coexist (a potential
-  problem when we're trying to read out of the file while a large flush is
-  going on).  The combination of the second and third points are the killer
-  -- I wouldn't care so much that we only allow one writer *or* N readers if
-  all DB ops were async (and preferably opaque to redis itself).  Async
-  ops to disk would of course be awesome from a throughput and average
-  latency perspective.
-
 * Keys lose their TTLs when they get stashed.  This presumably just involves
   modifying the data dumper/loader to include setting the TTL (as is done in
   full RDB files, probably).  I'll likely leave this for someone who uses
   TTLs on their keys.
-
-* Allow freezer operations to be non-blocking.  Probably not worth it for a
-  simple read or write operation, but if we've got longer-running operations
-  against the disk, it'd be nice to have those calls just go back into the
-  event queue for later.
 
 * 'keys', at present, will only work on the keys that are in-memory, and
   will completely disavow all knowledge of all the keys that are *only* in
