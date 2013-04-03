@@ -1923,7 +1923,7 @@ int prepareForShutdown(int flags) {
 #ifdef USE_NDS
     redisLog(REDIS_NOTICE, "Flushing dirty keys to NDS before exiting.");
     flushDirtyKeys();
-#endif
+#else
     if ((server.saveparamslen > 0 && !nosave) || save) {
         redisLog(REDIS_NOTICE,"Saving the final RDB snapshot before exiting.");
         /* Snapshotting. Perform a SYNC SAVE and exit */
@@ -1937,6 +1937,7 @@ int prepareForShutdown(int flags) {
             return REDIS_ERR;
         }
     }
+#endif
     if (server.daemonize) {
         redisLog(REDIS_NOTICE,"Removing the pid file.");
         unlink(server.pidfile);
@@ -2777,6 +2778,9 @@ int checkForSentinelMode(int argc, char **argv) {
 
 /* Function called at startup to load RDB or AOF file in memory. */
 void loadDataFromDisk(void) {
+#ifdef USE_NDS
+    redisLog(REDIS_NOTICE, "Using data from NDS");
+#else
     long long start = ustime();
     if (server.aof_state == REDIS_AOF_ON) {
         if (loadAppendOnlyFile(server.aof_filename) == REDIS_OK)
@@ -2790,6 +2794,7 @@ void loadDataFromDisk(void) {
             exit(1);
         }
     }
+#endif
 }
 
 void redisOutOfMemoryHandler(size_t allocation_size) {
