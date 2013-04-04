@@ -96,3 +96,14 @@ to anyone:
   great way to totally wedge your redis -- but it'll need fixing if anyone
   actually wants 'keys' to be useful.  I expect this'll be as simple as
   walking the disk database, but damn that'll take a while to get through.
+
+* Deletion needs to be queued like everything else, to prevent the
+  synchronous to-disk hit for every deletion.  This is just a matter of
+  making retrieval look in the flushing/dirty lists for a key, and *not*
+  going to disk if they're dirty (because they should definitely be in
+  memory if they exist).
+
+* At the moment, I think that if a child flush crashes, the flushing list
+  could be lost.  If the flush fails, we need to move the contents of flush
+  list into the 'dirty' list again, and perhaps trigger another flush
+  immediately.
