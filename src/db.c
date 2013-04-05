@@ -193,11 +193,11 @@ int dbDelete(redisDb *db, robj *key) {
      * the key, because it is shared with the main dictionary. */
     if (dictSize(db->expires) > 0) dictDelete(db->expires,key->ptr);
 
-    /* Deletion needs to be flushed to disk immediately, otherwise the
-     * previously stored value of the key could be retrieved from the
-     * freezer if it is asked for in the future.
-     */
-    if (server.nds && delNDS(db, key) == 1) {
+    if (server.nds && existsNDS(db, key->ptr)) {
+        /* The key may not be in memory, just in NDS, so we need to check
+         * there too in order to give the client the right answer to the
+         * DEL command.
+         */
         delcount++;
     }
 
