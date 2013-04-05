@@ -79,8 +79,12 @@ cutover downtime to a few seconds if you script it.
 TODO
 
 NDS is very new, and shouldn't be relied upon for anything really important. 
-There are a number of things that need to be fixed before it is of any use
-to anyone:
+There may be some pretty serious bugs in the code that haven't been found
+yet.  If you're not comfortable digging into the code to find the bug and
+submit a patch, you *probably* don't want to be deploying this thing right
+now.
+
+Here are the list of things that are known deficiencies in the code:
 
 * Stats.  It'd be nice to get cache hit rates, read and write counts, and
   all that sort of good stuff out of redis.
@@ -96,14 +100,3 @@ to anyone:
   great way to totally wedge your redis -- but it'll need fixing if anyone
   actually wants 'keys' to be useful.  I expect this'll be as simple as
   walking the disk database, but damn that'll take a while to get through.
-
-* Deletion needs to be queued like everything else, to prevent the
-  synchronous to-disk hit for every deletion.  This is just a matter of
-  making retrieval look in the flushing/dirty lists for a key, and *not*
-  going to disk if they're dirty (because they should definitely be in
-  memory if they exist).
-
-* At the moment, I think that if a child flush crashes, the flushing list
-  could be lost.  If the flush fails, we need to move the contents of flush
-  list into the 'dirty' list again, and perhaps trigger another flush
-  immediately.

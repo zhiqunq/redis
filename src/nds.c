@@ -84,16 +84,44 @@ static void nds_close(KCDB *kcdb) {
     }
 }
 
+/* Check whether a key exists in the NDS.  Give me a DB and a key, and
+ * I'll give you a 1/0 to say whether it exists or not.  You'll get -1
+ * if there was an error.
+ */
+static int nds_exists(redisDb *db, sds key) {
+    KCDB *kcdb = nds_open(db, 0);
+    int rv;
+        
+    if (!kcdb) {
+        rv = -1;
+        goto cleanup;
+    }
+    
+    rv = kcdbcheck(kcdb, key, sdslen(key));
+    
+cleanup:
+    nds_close(kcdb);
+    return rv;
+}
+
 /* Get a value out of the NDS.  Pass in the DB and key to get the value for,
  * and return an sds containing the value if found, or NULL on error or
  * key-not-found.  Will report errors via redisLog.  */
 static sds nds_get(redisDb *db, sds key) {
-    KCDB *kcdb = nds_open(db, 0);
+    KCDB *kcdb;
     char *valdata;
     size_t vallen;
     sds val = NULL;
 
-    if (!kcdb) {
+    if (isDirtyKey(db, key)) {
+        /* A dirty key *must* be in memory if it still exists.  If you're
+         * coming here, then the key *isn't* in memory, so I'm not going to
+         * go and get an out-of-date copy off disk for you.
+         */
+        return NULL;
+    }
+
+    if (!(kcdb = nds_open(db, 0))) {
         goto cleanup;
     }
     
@@ -198,6 +226,48 @@ cleanup:
     return rv;
 }
 
+/* Spam lots of dels in bulk.  Useful for flushes.  Returns the number of records
+ * deleted on success, or -1 on error.  If error, there are no guarantees of which
+ * keys may or may not have been deleted. */
+static int nds_bulk_del(redisDb *db, sds *keys, int kcount) {
+    KCDB *kcdb = NULL;
+    KCSTR *kckeys = NULL;
+    int rv = kcount;
+    
+    kckeys = zmalloc(sizeof(KCSTR) * kcount);
+    if (!kckeys) {
+        redisLog(REDIS_WARNING, "nds_bulk_del: Failed to allocate kckeys");
+        goto cleanup;
+    }
+    
+    for (int i = 0; i < kcount; i++) {
+    	kckeys[i].buf    = keys[i];
+    	kckeys[i].size   = sdslen(keys[i]);
+    }
+    
+    kcdb = nds_open(db, 1);
+    
+    if (!kcdb) {
+        rv = -1;
+        goto cleanup;
+    }
+    if (kcdbremovebulk(kcdb, kckeys, kcount, 0) == -1) {
+        redisLog(REDIS_WARNING, "NDS batch delete failed: %s", kcecodename(kcdbecode(kcdb)));
+        rv = -1;
+        goto cleanup;
+    }
+    
+cleanup:
+    if (kcdb) {
+        nds_close(kcdb);
+    }
+    if (kckeys) {
+        zfree(kckeys);
+    }
+    return rv;
+}
+
+
 static void nds_nuke(redisDb *db) {
     KCDB *kcdb = nds_open(db, 1);
     
@@ -282,6 +352,11 @@ int delNDS(redisDb *db, robj *key) {
     return rv;
 }
 
+/* Return 0/1 based on a key's existence in NDS. */
+int existsNDS(redisDb *db, robj *key) {
+    return nds_exists(db, key->ptr);
+}
+
 /* Clear all NDS databases */
 void nukeNDSFromOrbit() {
     redisDb *db;
@@ -303,20 +378,14 @@ void touchDirtyKey(redisDb *db, sds sdskey) {
     }
 }
 
-int isDirtyKey(redisDb *db, sds sdskey) {
-    dictEntry *de = dictFind(db->dirty_keys, sdskey);
-    
-    if (de) {
+int isDirtyKey(redisDb *db, sds key) {
+    if (dictFind(db->dirty_keys, key)
+        || dictFind(db->flushing_keys, key)
+       ) {
         return 1;
+    } else {
+        return 0;
     }
-    
-    de = dictFind(db->flushing_keys, sdskey);
-    
-    if (de) {
-        return 1;
-    }
-    
-    return 0;
 }
     
 /* Fork and flush all the dirty keys out to disk. */
@@ -324,6 +393,18 @@ int backgroundDirtyKeysFlush() {
     pid_t childpid;
 
     if (server.nds_child_pid != -1) return REDIS_ERR;
+    
+    /* Can't (shouldn't?) happen -- trying to flush while there's already a
+     * non-empty set of flushing keys. */
+    for (int i = 0; i < server.dbnum; i++) {
+        redisDb *db = server.db+i;
+        
+        if (dictSize(db->flushing_keys) > 0) {
+            redisLog(REDIS_WARNING, "FFFUUUUU- you can't flush when there's already keys being flushed.");
+            redisLog(REDIS_WARNING, "This isn't supposed to be able to happen.");
+            return REDIS_ERR;
+        }
+    }
     
     server.dirty_before_bgsave = server.dirty;
 
@@ -404,19 +485,16 @@ int flushDirtyKeys() {
             sds keystr = dictGetKey(deKey);
             deVal = dictFind(db->dict, keystr);
             if (!deVal) {
-                /* Key must have been deleted after it got dirtied.  That's
-                 * easy to handle -- it's already been deleted from the
-                 * freezer, so we just ignore it now and everything goes
-                 * away. */
-                redisLog(REDIS_DEBUG, "Key '%s' was deleted; not saving", keystr);
+                /* Key must have been deleted after it got dirtied.  Put it on
+                 * the end of the key list. */
                 nkeys--;
-                continue;
+                keys[nkeys] = keystr;
+            } else {
+                createDumpPayload(&payload, dictGetVal(deVal));
+                keys[i] = keystr;
+                vals[i] = payload.io.buffer.ptr;
+                i++;
             }
-            
-            createDumpPayload(&payload, dictGetVal(deVal));
-            keys[i] = keystr;
-            vals[i] = payload.io.buffer.ptr;
-            i++;
         }
 
         i = nds_bulk_put(db, keys, vals, nkeys);
@@ -425,6 +503,10 @@ int flushDirtyKeys() {
             redisLog(REDIS_NOTICE, "Flushed %i keys for DB %i", i, db->id);
         } else {
             redisLog(REDIS_WARNING, "Can't happen: flushed a short batch of keys (expected %i, actually flushed %i)", nkeys, i);
+        }
+        
+        if (dictSize(db->dirty_keys) > nkeys) {
+            nds_bulk_del(db, keys+nkeys, dictSize(db->dirty_keys) - nkeys);
         }
         
         /* Cleanup */
@@ -441,12 +523,34 @@ int flushDirtyKeys() {
 void backgroundNDSFlushDoneHandler(int exitcode, int bysignal) {
     redisLog(REDIS_NOTICE, "NDS background save completed.  exitcode=%i, bysignal=%i", exitcode, bysignal);
     if (exitcode == 0 || bysignal == 0) {
-        for (int j = 0; j < server.dbnum; j++) {
-            redisDb *db = server.db+j;
+        for (int i = 0; i < server.dbnum; i++) {
+            redisDb *db = server.db+i;
             dictEmpty(db->flushing_keys);
             server.dirty -= server.dirty_before_bgsave;
         }
+        server.lastsave = time(NULL);
+    } else {
+        /* Merge the flushing keys back into the dirty keys so that they'll be
+         * retried on the next flush, since we can't know for certain whether
+         * they got flushed before our child died */
+        for (int i = 0; i < server.dbnum; i++) {
+            redisDb *db = server.db+i;
+            dictIterator *di;
+            dictEntry *de;
+        
+            di = dictGetSafeIterator(db->flushing_keys);
+            if (!di) {
+                redisLog(REDIS_WARNING, "backgroundNDSFlushDoneHandler: dictGetSafeIterator failed!  This is terribad!");
+                return;
+            }
+            
+            while ((de = dictNext(di)) != NULL) {
+                dictAdd(db->dirty_keys, dictGetKey(de), NULL);
+            }
+            
+            dictEmpty(db->flushing_keys);
+        }
     }
-    server.lastsave = time(NULL);
+        
     server.nds_child_pid = -1;
 }
