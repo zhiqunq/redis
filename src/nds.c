@@ -69,6 +69,7 @@ static KCDB *nds_open(redisDb *db, int writer) {
 err_cleanup:
     if (kcdb) {
         kcdbdel(kcdb);
+        kcdb = NULL;
     }
 done:
     return kcdb;    
