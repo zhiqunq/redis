@@ -100,3 +100,13 @@ Here are the list of things that are known deficiencies in the code:
   great way to totally wedge your redis -- but it'll need fixing if anyone
   actually wants 'keys' to be useful.  I expect this'll be as simple as
   walking the disk database, but damn that'll take a while to get through.
+
+* We really need a way to trigger a "snapshot" of all the KC database files
+  for backup purposes.  I'm thinking an `NDS SNAPSHOT` command, which forks
+  a child that flushes the DB and makes a copy of all the .kch files.  This
+  command should block on completion, to simplify synchronisation with
+  backup processes (if it doesn't block, then whatever triggered the
+  snapshot needs to poll in order to know when the snapshot is complete so
+  that it can commence the backup run).  This design only works if reads can
+  be performed while the database is flushed (I can't see why it wouldn't,
+  but hackers be crazy, yo).
