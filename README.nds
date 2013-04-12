@@ -110,3 +110,10 @@ Here are the list of things that are known deficiencies in the code:
   that it can commence the backup run).  This design only works if reads can
   be performed while the database is flushed (I can't see why it wouldn't,
   but hackers be crazy, yo).
+
+* RDB dumps at present won't be complete, since RDB only looks in memory. 
+  This should only be a problem for replication, because we don't need RDB
+  locally any more, but yeah, replication == BROKEN for now.  The most
+  appropriate solution would be to transfer snapshots (above) and then
+  replay the dirty keys to the slave, before stating "yep, we're in sync". 
+
