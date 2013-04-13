@@ -39,6 +39,7 @@ robj *getNDS(redisDb *db, robj *key);
 void  setNDS(redisDb *db, robj *key, robj *val);
 int   delNDS(redisDb *db, robj *key);
 int   existsNDS(redisDb *db, robj *key);
+void  walkNDS(redisDb *db, void (*walkerCallback)(void *data, sds key), void *data);
 void  nukeNDSFromOrbit();
 
 void  touchDirtyKey(redisDb *db, sds sdskey);

@@ -1261,6 +1261,15 @@ unsigned int getKeysInSlot(unsigned int hashslot, robj **keys, unsigned int coun
 unsigned int countKeysInSlot(unsigned int hashslot);
 int verifyClusterConfigWithData(void);
 
+/* The blob we pass into functions that walk the keyspace for keysCommand */
+typedef struct {
+    redisClient *c;
+    sds pattern;
+    int plen;
+    int allkeys;
+    int numkeys;
+} keysCommandWalkerData;
+
 /* API to get key arguments from commands */
 #define REDIS_GETKEYS_ALL 0
 #define REDIS_GETKEYS_PRELOAD 1
