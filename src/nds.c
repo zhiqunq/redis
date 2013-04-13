@@ -59,7 +59,7 @@ static KCDB *nds_open(redisDb *db, int writer) {
     }
     
     if (!kcdbopen(kcdb, freezer_name, (writer ? KCOWRITER : KCOREADER) | KCOCREATE)) {
-        redisLog(REDIS_WARNING, "Failed to open the freezer: %s", kcecodename(kcdbecode(kcdb)));
+        redisLog(REDIS_WARNING, "Failed to open the freezer for DB %i: %s", db->id, kcecodename(kcdbecode(kcdb)));
         goto err_cleanup;
     }
 
@@ -363,10 +363,11 @@ int existsNDS(redisDb *db, robj *key) {
  * every key we find.  Pass in 'data' for any callback-specific state you
  * might like to deal with.
  */
-void walkNDS(redisDb *db, void (*walkerCallback)(void *, sds), void *data) {
+int walkNDS(redisDb *db, int (*walkerCallback)(void *, robj *, robj *), void *data) {
     KCCUR *cur = NULL;
     KCDB *kcdb = NULL;
     char *dbkey;
+    int rv = REDIS_OK;
     
     kcdb = nds_open(db, 0);
     if (!kcdb) {
@@ -385,10 +386,16 @@ void walkNDS(redisDb *db, void (*walkerCallback)(void *, sds), void *data) {
         
         dbkey = kccurgetkey(cur, &dbkeysize, 1);
         if (dbkey) {
-            sds key = sdsnewlen(dbkey, dbkeysize);
+            robj *key = createStringObject(dbkey, dbkeysize);
+            robj *val = getNDS(db, key);
             kcfree(dbkey);
-            walkerCallback(data, key);
-            sdsfree(key);
+            if (walkerCallback(data, key, val) == REDIS_ERR) {
+                redisLog(REDIS_DEBUG, "walkNDS terminated prematurely at callback's request");
+                dbkey = NULL;
+                rv = REDIS_ERR;
+            }
+            decrRefCount(key);
+            decrRefCount(val);
         }
     } while (dbkey);
     
@@ -397,6 +404,8 @@ cleanup:
         kccurdel(cur);
     }
     nds_close(kcdb);
+    
+    return rv;
 }
 
 /* Clear all NDS databases */

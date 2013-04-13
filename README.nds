@@ -108,9 +108,3 @@ Here are the list of things that are known deficiencies in the code:
   modifying the data dumper/loader to include setting the TTL (as is done in
   full RDB files, probably).  I'll likely leave this for someone who uses
   TTLs on their keys.
-
-* RDB dumps at present won't be complete, since RDB only looks in memory. 
-  This should only be a problem for replication, because we don't need RDB
-  locally any more, but yeah, replication == BROKEN for now.  The most
-  appropriate solution would be to transfer snapshots (above) and then
-  replay the dirty keys to the slave, before stating "yep, we're in sync". 

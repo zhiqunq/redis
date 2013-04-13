@@ -328,17 +328,18 @@ void randomkeyCommand(redisClient *c) {
     decrRefCount(key);
 }
 
-void keysCommandWalkerCallback(void *data, sds key) {
+int keysCommandWalkerCallback(void *data, robj *key, robj *val) {
     keysCommandWalkerData *w = (keysCommandWalkerData *)data;
+    REDIS_NOTUSED(val);
     
-    if (w->allkeys || stringmatchlen(w->pattern,w->plen,key,sdslen(key),0)) {
-        robj *keyobj = createStringObject(key,sdslen(key));
-        if (expireIfNeeded(w->c->db,keyobj) == 0) {
-            addReplyBulk(w->c,keyobj);
+    if (w->allkeys || stringmatchlen(w->pattern,w->plen,key->ptr,sdslen(key->ptr),0)) {
+        if (expireIfNeeded(w->c->db,key) == 0) {
+            addReplyBulk(w->c,key);
             w->numkeys++;
         }
-        decrRefCount(keyobj);
     }
+    
+    return REDIS_OK;
 }
 
 void keysCommand(redisClient *c) {
@@ -360,7 +361,9 @@ void keysCommand(redisClient *c) {
         di = dictGetSafeIterator(c->db->dict);
         while((de = dictNext(di)) != NULL) {
             sds key = dictGetKey(de);
-            keysCommandWalkerCallback(&w, key);
+            robj *keyobj = createStringObject(key, sdslen(key));
+            keysCommandWalkerCallback(&w, keyobj, NULL);
+            decrRefCount(keyobj);
         }
         dictReleaseIterator(di);
     }
