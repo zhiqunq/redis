@@ -359,6 +359,46 @@ int existsNDS(redisDb *db, robj *key) {
     return nds_exists(db, key->ptr);
 }
 
+/* Walk the entire keyspace of an NDS database, calling walkerCallback for
+ * every key we find.  Pass in 'data' for any callback-specific state you
+ * might like to deal with.
+ */
+void walkNDS(redisDb *db, void (*walkerCallback)(void *, sds), void *data) {
+    KCCUR *cur = NULL;
+    KCDB *kcdb = NULL;
+    char *dbkey;
+    
+    kcdb = nds_open(db, 0);
+    if (!kcdb) {
+        goto cleanup;
+    }
+    
+    cur = kcdbcursor(kcdb);
+    if (!kccurjump(cur)) {
+        redisLog(REDIS_WARNING, "Failed to go to beginning of the keyspace: %s", kcecodename(kcdbecode(kcdb)));
+    }
+    
+    redisLog(REDIS_DEBUG, "Walking the NDS keyspace for DB %i", db->id);
+    
+    do {
+        size_t dbkeysize;
+        
+        dbkey = kccurgetkey(cur, &dbkeysize, 1);
+        if (dbkey) {
+            sds key = sdsnewlen(dbkey, dbkeysize);
+            kcfree(dbkey);
+            walkerCallback(data, key);
+            sdsfree(key);
+        }
+    } while (dbkey);
+    
+cleanup:
+    if (cur) {
+        kccurdel(cur);
+    }
+    nds_close(kcdb);
+}
+
 /* Clear all NDS databases */
 void nukeNDSFromOrbit() {
     redisDb *db;

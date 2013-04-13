@@ -328,31 +328,43 @@ void randomkeyCommand(redisClient *c) {
     decrRefCount(key);
 }
 
-void keysCommand(redisClient *c) {
-    dictIterator *di;
-    dictEntry *de;
-    sds pattern = c->argv[1]->ptr;
-    int plen = sdslen(pattern), allkeys;
-    unsigned long numkeys = 0;
-    void *replylen = addDeferredMultiBulkLength(c);
-
-    di = dictGetSafeIterator(c->db->dict);
-    allkeys = (pattern[0] == '*' && pattern[1] == '\0');
-    while((de = dictNext(di)) != NULL) {
-        sds key = dictGetKey(de);
-        robj *keyobj;
-
-        if (allkeys || stringmatchlen(pattern,plen,key,sdslen(key),0)) {
-            keyobj = createStringObject(key,sdslen(key));
-            if (expireIfNeeded(c->db,keyobj) == 0) {
-                addReplyBulk(c,keyobj);
-                numkeys++;
-            }
-            decrRefCount(keyobj);
+void keysCommandWalkerCallback(void *data, sds key) {
+    keysCommandWalkerData *w = (keysCommandWalkerData *)data;
+    
+    if (w->allkeys || stringmatchlen(w->pattern,w->plen,key,sdslen(key),0)) {
+        robj *keyobj = createStringObject(key,sdslen(key));
+        if (expireIfNeeded(w->c->db,keyobj) == 0) {
+            addReplyBulk(w->c,keyobj);
+            w->numkeys++;
         }
+        decrRefCount(keyobj);
     }
-    dictReleaseIterator(di);
-    setDeferredMultiBulkLength(c,replylen,numkeys);
+}
+
+void keysCommand(redisClient *c) {
+    void *replylen = addDeferredMultiBulkLength(c);
+    keysCommandWalkerData w;
+
+    w.pattern = c->argv[1]->ptr;
+    w.plen = sdslen(w.pattern);
+    w.allkeys = (w.pattern[0] == '*' && w.pattern[1] == '\0');
+    w.c = c;
+    w.numkeys = 0;
+
+    if (server.nds) {
+        /* Oh my... this could take a while... */
+        walkNDS(c->db, keysCommandWalkerCallback, &w);
+    } else {
+        dictIterator *di;
+        dictEntry *de;
+        di = dictGetSafeIterator(c->db->dict);
+        while((de = dictNext(di)) != NULL) {
+            sds key = dictGetKey(de);
+            keysCommandWalkerCallback(&w, key);
+        }
+        dictReleaseIterator(di);
+    }
+    setDeferredMultiBulkLength(c,replylen,w.numkeys);
 }
 
 void dbsizeCommand(redisClient *c) {
