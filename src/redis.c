@@ -1463,6 +1463,8 @@ void initServer() {
     server.rdb_save_time_last = -1;
     server.rdb_save_time_start = -1;
     server.dirty = 0;
+    server.stat_nds_cache_hits = 0;
+    server.stat_nds_cache_misses = 0;
     server.stat_numcommands = 0;
     server.stat_numconnections = 0;
     server.stat_expiredkeys = 0;
@@ -2276,7 +2278,8 @@ sds genRedisInfoString(char *section) {
             dictSize(server.pubsub_channels),
             listLength(server.pubsub_patterns),
             server.stat_fork_time,
-            dictSize(server.migrate_cached_sockets));
+            dictSize(server.migrate_cached_sockets)
+           );
     }
 
     /* Replication */
@@ -2427,6 +2430,32 @@ sds genRedisInfoString(char *section) {
             }
         }
     }
+    
+    /* NDS */
+    if ((server.nds && (allsections || defsections)) || !strcasecmp(section,"nds")) {
+        double hit_rate;
+        
+        if (server.stat_nds_cache_hits == 0 && server.stat_nds_cache_misses == 0) {
+            hit_rate = -1;
+        } else {
+            hit_rate = 100.0 * (double)server.stat_nds_cache_hits /
+                        (server.stat_nds_cache_hits + server.stat_nds_cache_misses);
+        }
+
+        if (sections++) info = sdscat(info,"\r\n");
+        info = sdscatprintf(info,
+            "# NDS\r\n"
+            "nds_enabled:%i\r\n"
+            "nds_cache_hits:%lld\r\n"
+            "nds_cache_misses:%lld\r\n"
+            "nds_cache_hit_rate:%.02f%%\r\n",
+            server.nds,
+            server.stat_nds_cache_hits,
+            server.stat_nds_cache_misses,
+            hit_rate
+        );
+    }
+    
     return info;
 }
 

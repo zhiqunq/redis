@@ -754,13 +754,19 @@ void ndsCommand(redisClient *c) {
     } else if (!strcasecmp(c->argv[1]->ptr,"flush")) {
         if (c->argc != 2) goto badarity;
         ndsFlush(c);
+    } else if (!strcasecmp(c->argv[1]->ptr,"clearstats")) {
+        if (c->argc != 2) goto badarity;
+        server.stat_nds_cache_hits = 0;
+        server.stat_nds_cache_misses = 0;
     } else {
         addReplyError(c,
-            "NDS subcommand must be SNAPSHOT or FLUSH");
+            "NDS subcommand must be SNAPSHOT, FLUSH, or CLEARSTATS");
+        return;
     }
+    addReply(c, shared.ok);
     return;
 
 badarity:
-    addReplyErrorFormat(c,"Wrong number of arguments for CONFIG %s",
+    addReplyErrorFormat(c,"Wrong number of arguments for NDS %s",
         (char*) c->argv[1]->ptr);
 }

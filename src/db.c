@@ -50,9 +50,13 @@ robj *lookupKey(redisDb *db, robj *key) {
     }
 
     if (server.nds) {
-        if (!de) {
+        if (de) {
+            server.stat_nds_cache_hits++;
+        } else {
             robj *obj = getNDS(db, key);
             
+            server.stat_nds_cache_misses++;
+
             if (obj) {
                 /* It would be neat to be able to use dbAdd here, but we'd end
                  * up with an unnecessary write to the DB if we did, because
