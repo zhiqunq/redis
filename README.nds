@@ -101,9 +101,6 @@ now.
 
 Here are the list of things that are known deficiencies in the code:
 
-* Stats.  It'd be nice to get cache hit rates, read and write counts, and
-  all that sort of good stuff out of redis.
-
 * Keys lose their TTLs when they get stashed.  This presumably just involves
   modifying the data dumper/loader to include setting the TTL (as is done in
   full RDB files, probably).  I'll likely leave this for someone who uses
