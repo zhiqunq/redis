@@ -679,7 +679,7 @@ int rdbSave(char *filename) {
         if (rdbSaveLen(&rdb,j) == -1) goto werr;
 
         if (server.nds) {
-            if (walkNDS(idata.db, rdbSaveIterator, &idata) == REDIS_ERR) {
+            if (walkNDS(idata.db, rdbSaveIterator, &idata, -1) == REDIS_ERR) {
                 goto werr;
             }
         } else {
