@@ -1168,7 +1168,7 @@ void zsetConvert(robj *zobj, int encoding);
 unsigned long zslGetRank(zskiplist *zsl, double score, robj *o);
 
 /* Core functions */
-int freeMemoryIfNeeded(void);
+int freeMemoryIfNeeded(int headroom);
 int processCommand(redisClient *c);
 void setupSignalHandlers(void);
 struct redisCommand *lookupCommand(sds name);
