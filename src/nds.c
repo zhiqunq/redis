@@ -551,7 +551,6 @@ int backgroundDirtyKeysFlush() {
             dTmp = db->flushing_keys;
             db->flushing_keys = db->dirty_keys;
             db->dirty_keys = dTmp;
-            dictEmpty(db->dirty_keys);
         }
         return REDIS_OK;
     }
