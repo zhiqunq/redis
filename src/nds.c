@@ -623,6 +623,11 @@ int flushDirtyKeys() {
         }
         
         /* Cleanup */
+        for (; i >= 0; i--) {
+            if (vals[i]) {
+                sdsfree(vals[i]);
+            }
+        }
         zfree(keys);
         zfree(vals);
     }
