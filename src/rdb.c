@@ -627,15 +627,20 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val,
     return 1;
 }
 
-int rdbSaveIterator(void *data, robj *key, robj *val) {
+int rdbSaveIterator(void *data, robj *key) {
     rdbSaveIterData *idata = (rdbSaveIterData *)data;
     long long expire = getExpire(idata->db, key);
+    robj *val = lookupKey(idata->db, key);
+    int rv = 0;
     
     if (rdbSaveKeyValuePair(idata->rdb, key, val, expire, idata->now) == -1) {
-        return REDIS_ERR;
+    	rv = REDIS_ERR;
     } else {
-        return REDIS_OK;
+    	rv = REDIS_OK;
     }
+    
+    decrRefCount(val);
+    return rv;
 }
 
 /* Save the DB on disk. Return REDIS_ERR on error, REDIS_OK on success */
@@ -692,10 +697,10 @@ int rdbSave(char *filename) {
             /* Iterate this DB writing every entry */
             while((de = dictNext(di)) != NULL) {
                 sds keystr = dictGetKey(de);
-                robj key, *o = dictGetVal(de);
+                robj key;
             
                 initStaticStringObject(key,keystr);
-                if (rdbSaveIterator(&idata, &key, o) == REDIS_ERR) {
+                if (rdbSaveIterator(&idata, &key) == REDIS_ERR) {
                     redisLog(REDIS_WARNING, "rdbSaveIterator failed");
                     goto werr;
                 }
