@@ -1463,8 +1463,6 @@ void initServer() {
     server.nds_preload_complete = 0;
     server.nds_snapshot_pending = 0;
     server.nds_snapshot_in_progress = 0;
-    server.nds_defrag_pending = 0;
-    server.nds_defrag_in_progress = 0;
     aofRewriteBufferReset();
     server.aof_buf = sdsempty();
     server.lastsave = time(NULL);
@@ -2470,8 +2468,6 @@ sds genRedisInfoString(char *section) {
             "nds_preload_complete:%i\r\n"
             "nds_snapshot_pending:%i\r\n"
             "nds_snapshot_in_progress:%i\r\n"
-            "nds_defrag_pending:%i\r\n"
-            "nds_defrag_in_progress:%i\r\n"
             "nds_child_pid:%i\r\n",
             server.nds,
             server.nds_preload,
@@ -2487,8 +2483,6 @@ sds genRedisInfoString(char *section) {
             server.nds_preload_complete,
             server.nds_snapshot_pending,
             server.nds_snapshot_in_progress,
-            server.nds_defrag_pending,
-            server.nds_defrag_in_progress,
             server.nds_child_pid
         );
     }
