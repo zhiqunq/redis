@@ -1463,6 +1463,7 @@ void initServer() {
     server.nds_preload_complete = 0;
     server.nds_snapshot_pending = 0;
     server.nds_snapshot_in_progress = 0;
+    server.mdb_env = NULL;
     aofRewriteBufferReset();
     server.aof_buf = sdsempty();
     server.lastsave = time(NULL);
