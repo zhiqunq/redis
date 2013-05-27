@@ -35,6 +35,8 @@
 void initClientMultiState(redisClient *c) {
     c->mstate.commands = NULL;
     c->mstate.count = 0;
+    c->mstate.minreplicas = 0;
+    c->mstate.minreplicas_timeout = 0;
 }
 
 /* Release all the resources associated with MULTI/EXEC state */
@@ -319,5 +321,32 @@ void watchCommand(redisClient *c) {
 void unwatchCommand(redisClient *c) {
     unwatchAllKeys(c);
     c->flags &= (~REDIS_DIRTY_CAS);
+    addReply(c,shared.ok);
+}
+
+/* ------------------------- MINREPLICAS implementation --------------------- */
+
+/* MINREPLICAS <count> <timeout> */
+void minreplicasCommand(redisClient *c) {
+    long timeout, minreplicas;
+
+    if (!(c->flags & REDIS_MULTI)) {
+        addReplyError(c,"MINREPLICAS without MULTI");
+        return;
+    }
+    if (getLongFromObjectOrReply(c,object,&minreplicas,
+        "number of replicas is not an integer or out of range") != REDIS_OK)
+        return REDIS_ERR;
+
+    if (getLongFromObjectOrReply(c,object,&timeout,
+        "timeout is not an integer or out of range") != REDIS_OK)
+        return REDIS_ERR;
+
+    /* Force sane values. */
+    if (timeout < 0) timeout = 0;
+    if (minreplicas < 0) minreplicas = 0;
+
+    c->mstate.minreplicas = minreplicas;
+    c->mstate.minreplicas_timeout = timeout;
     addReply(c,shared.ok);
 }

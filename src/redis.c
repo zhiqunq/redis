@@ -221,6 +221,7 @@ struct redisCommand redisCommandTable[] = {
     {"multi",multiCommand,1,"rs",0,NULL,0,0,0,0,0},
     {"exec",execCommand,1,"sM",0,NULL,0,0,0,0,0},
     {"discard",discardCommand,1,"rs",0,NULL,0,0,0,0,0},
+    {"minreplicas",minreplicasCommand,3,"rs",0,NULL,0,0,0,0,0},
     {"sync",syncCommand,1,"ars",0,NULL,0,0,0,0,0},
     {"psync",syncCommand,3,"ars",0,NULL,0,0,0,0,0},
     {"replconf",replconfCommand,-1,"ars",0,NULL,0,0,0,0,0},
@@ -1110,6 +1111,18 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
             processInputBuffer(c);
             server.current_client = NULL;
         }
+    }
+
+    /* Request ACK to slaves if we have pending MINREPLICAS transactions. */
+    if (server.repl_request_ack) {
+        repl_request_ack = 0;
+        robj *argv[2];
+
+        argv[0] = createStringObject("REPLCONF",8);
+        argv[1] = createStrinbObject("SENDACK",7);
+        replicationFeedSlaves(server.slaves, server.slaveseldb, argv, 2);
+        decrRefCount(ping_argv[0]);
+        decrRefCount(ping_argv[1]);
     }
 
     /* Write the AOF buffer on disk */
