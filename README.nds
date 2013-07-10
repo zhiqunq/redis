@@ -59,11 +59,6 @@ There are three new configuration parameters available:
   persistence model.  You probably shouldn't enable this option if you're
   trying to keep your memory usage under control.
 
-* `nds-compress-snapshots` -- set this to `yes` to tell NDS to compress
-  snapshots (through the simple expedient of shelling out to `gzip`) after
-  they've been made.  Takes a bit of time, but saves a whole pile of
-  diskspace.
-
 Once NDS is enabled, you want to change the value of the `save` parameter to
 something really, really low, because saving the changed keys to disk
 doesn't cost very much at all.  I use `5 1 1 5` usually, just because I like
@@ -109,11 +104,9 @@ There are a few commands that have been added to the redis command set:
   (I can't imagine why you'd need to, but it's there if you want it).
 
 * `NDS SNAPSHOT` -- Take a copy of all of the NDS data files, so you can get
-  consistent disk backups of all your redis data.  The snapshots will be
-  named `snapshot_%i.kch` (where `%i` is the database ID).  For backup
-  purposes, you should exclude all files matching `freezer_*.kch` in your
-  redis data directory (they're the "live" files that will likely change
-  underneath your backup agent).
+  consistent disk backups of all your redis data.  The snapshot will be
+  stored in a directory underneath your Redis data directory named,
+  unimaginatively enough, "snapshot".
 
 * `NDS CLEARSTATS` -- If you want to nuke the cache hit/miss numbers, this
   is how to do it.
@@ -137,9 +130,6 @@ If you want to move away from NDS, here is the simplest way:
 
 * Start Redis again.  Since NDS is now disabled, Redis will read all data
   into memory from the `dump.rdb` file.
-
-* You can now nuke all `freezer_*.kch` and `snapshot_*.kch` files in your
-  Redis data directory.
 
 You can reduce the amount of downtime by using AOF instead of RDB, too.
 
