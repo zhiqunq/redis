@@ -225,6 +225,9 @@ long long emptyDb() {
         removed += dictSize(server.db[j].dict);
         dictEmpty(server.db[j].dict);
         dictEmpty(server.db[j].expires);
+        if (server.nds) {
+            emptyNDS(&(server.db[j]));
+        }
     }
     if (server.cluster_enabled) slotToKeyFlush();
     return removed;
@@ -266,6 +269,9 @@ void flushdbCommand(redisClient *c) {
     signalFlushedDb(c->db->id);
     dictEmpty(c->db->dict);
     dictEmpty(c->db->expires);
+    if (server.nds) {
+        emptyNDS(c->db);
+    }
     if (server.cluster_enabled) slotToKeyFlush();
     addReply(c,shared.ok);
 }
