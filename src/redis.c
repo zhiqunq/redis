@@ -30,6 +30,7 @@
 #include "redis.h"
 #include "slowlog.h"
 #include "bio.h"
+#include "nds.h"
 
 #include <time.h>
 #include <signal.h>
@@ -234,6 +235,7 @@ struct redisCommand redisCommandTable[] = {
     {"slaveof",slaveofCommand,3,"ast",0,NULL,0,0,0,0,0},
     {"debug",debugCommand,-2,"as",0,NULL,0,0,0,0,0},
     {"config",configCommand,-2,"ar",0,NULL,0,0,0,0,0},
+    {"nds",ndsCommand,-2,"ar",0,NULL,0,0,0,0,0},
     {"subscribe",subscribeCommand,-2,"rpslt",0,NULL,0,0,0,0,0},
     {"unsubscribe",unsubscribeCommand,-1,"rpslt",0,NULL,0,0,0,0,0},
     {"psubscribe",psubscribeCommand,-2,"rpslt",0,NULL,0,0,0,0,0},
@@ -1055,7 +1057,10 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     }
 
     /* Check if a background saving or AOF rewrite in progress terminated. */
-    if (server.rdb_child_pid != -1 || server.aof_child_pid != -1) {
+    if (server.rdb_child_pid != -1
+        || server.aof_child_pid != -1
+        || server.nds_child_pid != -1
+       ) {
         int statloc;
         pid_t pid;
 
@@ -1063,16 +1068,25 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
             int exitcode = WEXITSTATUS(statloc);
             int bysignal = 0;
             
+            if (pid == -1) {
+                redisLog(REDIS_WARNING, "wait3() failed: %s", strerror(errno));
+            }
+
             if (WIFSIGNALED(statloc)) bysignal = WTERMSIG(statloc);
 
-            if (pid == server.rdb_child_pid) {
-                backgroundSaveDoneHandler(exitcode,bysignal);
-            } else if (pid == server.aof_child_pid) {
-                backgroundRewriteDoneHandler(exitcode,bysignal);
-            } else {
-                redisLog(REDIS_WARNING,
-                    "Warning, detected child with unmatched pid: %ld",
-                    (long)pid);
+            if (pid > 0) {
+                if (pid == server.rdb_child_pid) {
+                    backgroundSaveDoneHandler(exitcode,bysignal);
+                } else if (pid == server.aof_child_pid) {
+                    backgroundRewriteDoneHandler(exitcode,bysignal);
+                } else if (pid == server.nds_child_pid) {
+                    backgroundNDSFlushDoneHandler(exitcode,bysignal);
+                } else {
+                    redisLog(REDIS_WARNING,
+                        "Warning, detected child with unmatched pid: %ld",
+                        (long)pid);
+                }
+                updateDictResizePolicy();
             }
             updateDictResizePolicy();
         }
@@ -1092,9 +1106,14 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
                  REDIS_BGSAVE_RETRY_DELAY ||
                  server.lastbgsave_status == REDIS_OK))
             {
-                redisLog(REDIS_NOTICE,"%d changes in %d seconds. Saving...",
-                    sp->changes, (int)sp->seconds);
-                rdbSaveBackground(server.rdb_filename);
+                /* RDB periodic dumps are redundant if we've got NDS */
+                if (server.nds) {
+                    backgroundDirtyKeysFlush();
+                } else {
+                    redisLog(REDIS_NOTICE,"%d changes in %d seconds. Saving...",
+                        sp->changes, (int)sp->seconds);
+                    rdbSaveBackground(server.rdb_filename);
+                }
                 break;
             }
          }
@@ -1295,6 +1314,8 @@ void initServerConfig() {
     server.aof_selected_db = -1; /* Make sure the first time will not match */
     server.aof_flush_postponed_start = 0;
     server.aof_rewrite_incremental_fsync = REDIS_DEFAULT_AOF_REWRITE_INCREMENTAL_FSYNC;
+    server.nds = 0;
+    server.nds_preload = 0;
     server.pidfile = zstrdup(REDIS_DEFAULT_PID_FILE);
     server.rdb_filename = zstrdup(REDIS_DEFAULT_RDB_FILENAME);
     server.aof_filename = zstrdup("appendonly.aof");
@@ -1544,6 +1565,8 @@ void initServer() {
         server.db[j].blocking_keys = dictCreate(&keylistDictType,NULL);
         server.db[j].ready_keys = dictCreate(&setDictType,NULL);
         server.db[j].watched_keys = dictCreate(&keylistDictType,NULL);
+        server.db[j].dirty_keys = dictCreate(&dbDictType, NULL);
+        server.db[j].flushing_keys = dictCreate(&dbDictType, NULL);
         server.db[j].id = j;
         server.db[j].avg_ttl = 0;
     }
@@ -1554,6 +1577,13 @@ void initServer() {
     server.cronloops = 0;
     server.rdb_child_pid = -1;
     server.aof_child_pid = -1;
+    server.nds_child_pid = -1;
+    server.nds_preload_in_progress = 0;
+    server.nds_preload_complete = 0;
+    server.nds_snapshot_pending = 0;
+    server.nds_snapshot_in_progress = 0;
+    server.nds_bg_requestor = NULL;
+    server.mdb_env = NULL;
     aofRewriteBufferReset();
     server.aof_buf = sdsempty();
     server.lastsave = time(NULL); /* At startup we consider the DB saved. */
@@ -1561,6 +1591,10 @@ void initServer() {
     server.rdb_save_time_last = -1;
     server.rdb_save_time_start = -1;
     server.dirty = 0;
+    server.stat_nds_cache_hits = 0;
+    server.stat_nds_cache_misses = 0;
+    server.stat_nds_flush_success = 0;
+    server.stat_nds_flush_failure = 0;
     server.stat_numcommands = 0;
     server.stat_numconnections = 0;
     server.stat_expiredkeys = 0;
@@ -2046,17 +2080,22 @@ int prepareForShutdown(int flags) {
         redisLog(REDIS_NOTICE,"Calling fsync() on the AOF file.");
         aof_fsync(server.aof_fd);
     }
-    if ((server.saveparamslen > 0 && !nosave) || save) {
-        redisLog(REDIS_NOTICE,"Saving the final RDB snapshot before exiting.");
-        /* Snapshotting. Perform a SYNC SAVE and exit */
-        if (rdbSave(server.rdb_filename) != REDIS_OK) {
-            /* Ooops.. error saving! The best we can do is to continue
-             * operating. Note that if there was a background saving process,
-             * in the next cron() Redis will be notified that the background
-             * saving aborted, handling special stuff like slaves pending for
-             * synchronization... */
-            redisLog(REDIS_WARNING,"Error trying to save the DB, can't exit.");
-            return REDIS_ERR;
+    if (server.nds) {
+        redisLog(REDIS_NOTICE, "Flushing dirty keys to NDS before exiting.");
+        flushDirtyKeys();
+    } else {
+        if ((server.saveparamslen > 0 && !nosave) || save) {
+            redisLog(REDIS_NOTICE,"Saving the final RDB snapshot before exiting.");
+            /* Snapshotting. Perform a SYNC SAVE and exit */
+            if (rdbSave(server.rdb_filename) != REDIS_OK) {
+                /* Ooops.. error saving! The best we can do is to continue
+                 * operating. Note that if there was a background saving process,
+                 * in the next cron() Redis will be notified that the background
+                 * saving aborted, handling special stuff like slaves pending for
+                 * synchronization... */
+                redisLog(REDIS_WARNING,"Error trying to save the DB, can't exit.");
+                return REDIS_ERR;
+            }
         }
     }
     if (server.daemonize) {
@@ -2544,6 +2583,8 @@ sds genRedisInfoString(char *section) {
 
     /* Key space */
     if (allsections || defsections || !strcasecmp(section,"keyspace")) {
+        size_t ndskeys = 0;
+        
         if (sections++) info = sdscat(info,"\r\n");
         info = sdscatprintf(info, "# Keyspace\r\n");
         for (j = 0; j < server.dbnum; j++) {
@@ -2551,13 +2592,67 @@ sds genRedisInfoString(char *section) {
 
             keys = dictSize(server.db[j].dict);
             vkeys = dictSize(server.db[j].expires);
-            if (keys || vkeys) {
+            if (server.nds) {
+                ndskeys = keyCountNDS(server.db+j);
+            }
+            if (keys || vkeys || ndskeys) {
+                char ndskeystr[1024] = "";
+                
+                if (server.nds) {
+                    snprintf(ndskeystr, 1023, ",nds=%lu", ndskeys);
+                }
                 info = sdscatprintf(info,
-                    "db%d:keys=%lld,expires=%lld,avg_ttl=%lld\r\n",
-                    j, keys, vkeys, server.db[j].avg_ttl);
+                    "db%d:keys=%lld,expires=%lld,avg_ttl=%lld%s\r\n",
+                    j, keys, vkeys, server.db[j].avg_ttl, ndskeystr);
             }
         }
     }
+    
+    /* NDS */
+    if ((server.nds && (allsections || defsections)) || !strcasecmp(section,"nds")) {
+        double hit_rate;
+        
+        if (server.stat_nds_cache_hits == 0 && server.stat_nds_cache_misses == 0) {
+            hit_rate = -1;
+        } else {
+            hit_rate = 100.0 * (double)server.stat_nds_cache_hits /
+                        (server.stat_nds_cache_hits + server.stat_nds_cache_misses);
+        }
+        
+        if (sections++) info = sdscat(info,"\r\n");
+        info = sdscatprintf(info,
+            "# NDS\r\n"
+            "nds_enabled:%i\r\n"
+            "nds_preload:%i\r\n"
+            "nds_cache_hits:%llu\r\n"
+            "nds_cache_misses:%llu\r\n"
+            "nds_cache_hit_rate:%.02f%%\r\n"
+            "nds_dirty_keys:%llu\r\n"
+            "nds_flushing_keys:%llu\r\n"
+            "nds_flush_success:%llu\r\n"
+            "nds_flush_failure:%llu\r\n"
+            "nds_preload_in_progress:%i\r\n"
+            "nds_preload_complete:%i\r\n"
+            "nds_snapshot_pending:%i\r\n"
+            "nds_snapshot_in_progress:%i\r\n"
+            "nds_child_pid:%i\r\n",
+            server.nds,
+            server.nds_preload,
+            server.stat_nds_cache_hits,
+            server.stat_nds_cache_misses,
+            hit_rate,
+            dirtyKeyCount(),
+            flushingKeyCount(),
+            server.stat_nds_flush_success,
+            server.stat_nds_flush_failure,
+            server.nds_preload_in_progress,
+            server.nds_preload_complete,
+            server.nds_snapshot_pending,
+            server.nds_snapshot_in_progress,
+            server.nds_child_pid
+        );
+    }
+    
     return info;
 }
 
@@ -2708,8 +2803,9 @@ int freeMemoryIfNeeded(void) {
                 }
             }
 
-            /* Finally remove the selected key. */
-            if (bestkey) {
+            /* Finally remove the selected key, (as long as it isn't dirty, if
+             * we're using NDS) */
+            if (bestkey && !isDirtyKey(db, bestkey)) {
                 long long delta;
 
                 robj *keyobj = createStringObject(bestkey,sdslen(bestkey));
@@ -2723,7 +2819,12 @@ int freeMemoryIfNeeded(void) {
                  * AOF and Output buffer memory will be freed eventually so
                  * we only care about memory used by the key space. */
                 delta = (long long) zmalloc_used_memory();
-                dbDelete(db,keyobj);
+
+                /* dbDelete nukes the key from NDS, which is quite particularly
+                 * not what we want.  So we do it by hand. */
+                if (dictSize(db->expires) > 0) dictDelete(db->expires,keyobj->ptr);
+                dictDelete(db->dict,keyobj->ptr);
+
                 delta -= (long long) zmalloc_used_memory();
                 mem_freed += delta;
                 server.stat_evictedkeys++;
@@ -2739,7 +2840,22 @@ int freeMemoryIfNeeded(void) {
                 if (slaves) flushSlavesOutputBuffers();
             }
         }
-        if (!keys_freed) return REDIS_ERR; /* nothing to free... */
+        if (!keys_freed) {
+            /* We didn't manage to free enough memory!  If we're using NDS
+             * (and thus may have dirty keys hogging up all our memory)
+             * we can trigger a flush of those dirty keys, and then at
+             * least we'll eventually get our memory back -- but in the
+             * meantime, we'll still want to deny writes, to avoid memory
+             * usage ballooning any further */
+            if (server.nds) {
+                if (server.nds_child_pid == -1 && backgroundDirtyKeysFlush() == REDIS_ERR) {
+                    redisLog(REDIS_WARNING, "Failed to trigger background key flush in freeMemoryIfNeeded.  Urgh.");
+                }
+            } else {
+                redisLog(REDIS_WARNING, "No keys suitable for eviction");
+            }
+            return REDIS_ERR; /* nothing to free... */
+        }
     }
     return REDIS_OK;
 }
@@ -2885,17 +3001,25 @@ int checkForSentinelMode(int argc, char **argv) {
 
 /* Function called at startup to load RDB or AOF file in memory. */
 void loadDataFromDisk(void) {
-    long long start = ustime();
-    if (server.aof_state == REDIS_AOF_ON) {
-        if (loadAppendOnlyFile(server.aof_filename) == REDIS_OK)
-            redisLog(REDIS_NOTICE,"DB loaded from append only file: %.3f seconds",(float)(ustime()-start)/1000000);
+    if (server.nds) {
+        redisLog(REDIS_NOTICE, "Using data from NDS");
+        if (server.nds_preload) {
+            redisLog(REDIS_NOTICE, "Preloading all NDS data");
+            preloadNDS();
+        }
     } else {
-        if (rdbLoad(server.rdb_filename) == REDIS_OK) {
-            redisLog(REDIS_NOTICE,"DB loaded from disk: %.3f seconds",
-                (float)(ustime()-start)/1000000);
-        } else if (errno != ENOENT) {
-            redisLog(REDIS_WARNING,"Fatal error loading the DB: %s. Exiting.",strerror(errno));
-            exit(1);
+        long long start = ustime();
+        if (server.aof_state == REDIS_AOF_ON) {
+            if (loadAppendOnlyFile(server.aof_filename) == REDIS_OK)
+                redisLog(REDIS_NOTICE,"DB loaded from append only file: %.3f seconds",(float)(ustime()-start)/1000000);
+        } else {
+            if (rdbLoad(server.rdb_filename) == REDIS_OK) {
+                redisLog(REDIS_NOTICE,"DB loaded from disk: %.3f seconds",
+                    (float)(ustime()-start)/1000000);
+            } else if (errno != ENOENT) {
+                redisLog(REDIS_WARNING,"Fatal error loading the DB: %s. Exiting.",strerror(errno));
+                exit(1);
+            }
         }
     }
 }
