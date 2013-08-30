@@ -615,7 +615,9 @@ int backgroundDirtyKeysFlush() {
         redisLog(REDIS_DEBUG, "In child");
         
         /* Child */
-        if (server.ipfd > 0) close(server.ipfd);
+        for (int i = 0; i < server.ipfd_count; i++) {
+            if (server.ipfd[i] > 0) close(server.ipfd[i]);
+        }
         if (server.sofd > 0) close(server.sofd);
         
         redisSetProcTitle("redis-nds-flush");

@@ -31,6 +31,8 @@
 #include "redis.h"
 #include "endianconv.h"
 
+#include <sys/types.h>
+#include <sys/socket.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -231,7 +233,6 @@ void clusterInit(void) {
     server.cluster->state = REDIS_CLUSTER_FAIL;
     server.cluster->size = 1;
     server.cluster->nodes = dictCreate(&clusterNodesDictType,NULL);
-    server.cluster->node_timeout = 15;
     server.cluster->failover_auth_time = 0;
     server.cluster->failover_auth_count = 0;
     memset(server.cluster->migrating_slots_to,0,
@@ -251,15 +252,25 @@ void clusterInit(void) {
         saveconf = 1;
     }
     if (saveconf) clusterSaveConfigOrDie();
-    /* We need a listening TCP port for our cluster messaging needs */
-    server.cfd = anetTcpServer(server.neterr,
-            server.port+REDIS_CLUSTER_PORT_INCR, server.bindaddr);
-    if (server.cfd == -1) {
-        redisLog(REDIS_WARNING, "Opening cluster TCP port: %s", server.neterr);
+
+    /* We need a listening TCP port for our cluster messaging needs. */
+    server.cfd_count = 0;
+    if (listenToPort(server.port+REDIS_CLUSTER_PORT_INCR,
+        server.cfd,&server.cfd_count) == REDIS_ERR)
+    {
         exit(1);
+    } else {
+        int j;
+
+        for (j = 0; j < server.cfd_count; j++) {
+            if (aeCreateFileEvent(server.el, server.cfd[j], AE_READABLE,
+                clusterAcceptHandler, NULL) == AE_ERR)
+                    redisPanic("Unrecoverable error creating Redis Cluster "
+                                "file event.");
+        }
     }
-    if (aeCreateFileEvent(server.el, server.cfd, AE_READABLE,
-        clusterAcceptHandler, NULL) == AE_ERR) redisPanic("Unrecoverable error creating Redis Cluster file event.");
+
+    /* The slots -> keys map is a sorted set. Init it. */
     server.cluster->slots_to_keys = zslCreate();
 }
 
@@ -269,6 +280,7 @@ void clusterInit(void) {
 
 clusterLink *createClusterLink(clusterNode *node) {
     clusterLink *link = zmalloc(sizeof(*link));
+    link->ctime = time(NULL);
     link->sndbuf = sdsempty();
     link->rcvbuf = sdsempty();
     link->node = node;
@@ -277,7 +289,7 @@ clusterLink *createClusterLink(clusterNode *node) {
 }
 
 /* Free a cluster link, but does not free the associated node of course.
- * Just this function will make sure that the original node associated
+ * This function will just make sure that the original node associated
  * with this link will have the 'link' field set to NULL. */
 void freeClusterLink(clusterLink *link) {
     if (link->fd != -1) {
@@ -294,17 +306,18 @@ void freeClusterLink(clusterLink *link) {
 
 void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     int cport, cfd;
-    char cip[128];
+    char cip[REDIS_IP_STR_LEN];
     clusterLink *link;
     REDIS_NOTUSED(el);
     REDIS_NOTUSED(mask);
     REDIS_NOTUSED(privdata);
 
-    cfd = anetTcpAccept(server.neterr, fd, cip, &cport);
+    cfd = anetTcpAccept(server.neterr, fd, cip, sizeof(cip), &cport);
     if (cfd == AE_ERR) {
         redisLog(REDIS_VERBOSE,"Accepting cluster node: %s", server.neterr);
         return;
     }
+    /* IPV6: might want to wrap a v6 address in [] */
     redisLog(REDIS_VERBOSE,"Accepted cluster node %s:%d", cip, cport);
     /* We need to create a temporary node in order to read the incoming
      * packet in a valid contest. This node will be released once we
@@ -350,8 +363,6 @@ clusterNode *createClusterNode(char *nodename, int flags) {
     node->slaveof = NULL;
     node->ping_sent = node->pong_received = 0;
     node->fail_time = 0;
-    node->configdigest = NULL;
-    node->configdigest_ts = 0;
     node->link = NULL;
     memset(node->ip,0,sizeof(node->ip));
     node->port = 0;
@@ -405,7 +416,8 @@ void clusterNodeCleanupFailureReports(clusterNode *node) {
     listNode *ln;
     listIter li;
     clusterNodeFailReport *fr;
-    time_t maxtime = server.cluster->node_timeout*2;
+    time_t maxtime = server.cluster_node_timeout *
+                     REDIS_CLUSTER_FAIL_REPORT_VALIDITY_MULT;
     time_t now = time(NULL);
 
     listRewind(l,&li);
@@ -631,12 +643,17 @@ void clearNodeFailureIfNeeded(clusterNode *node) {
     }
 
     /* If it is a master and...
-     * 1) The FAIL state was set more than 2 times the node timeout + 10 sec.
+     * 1) The FAIL state is old enough. We use our node timeout multiplicator
+     *    plus some additional fixed time. The additional time is useful when
+     *    the node timeout is extremely short and the reaction time of
+     *    the cluster may be longer, so wait at least a few seconds always.
      * 2) It is yet serving slots from our point of view (not failed over).
      * Apparently no one is going to fix these slots, clear the FAIL flag. */
     if (node->flags & REDIS_NODE_MASTER &&
         node->numslots > 0 &&
-        (now - node->fail_time) > (server.cluster->node_timeout*2+10))
+        (now - node->fail_time) >
+        (server.cluster_node_timeout * REDIS_CLUSTER_FAIL_UNDO_TIME_MULT +
+                                        REDIS_CLUSTER_FAIL_UNDO_TIME_ADD))
     {
         redisLog(REDIS_NOTICE,
             "Clear FAIL state for node %.40s: is reachable again and nobody is serving its slots after some time.",
@@ -687,15 +704,8 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
         /* Update our state accordingly to the gossip sections */
         node = clusterLookupNode(g->nodename);
         if (node != NULL) {
-            /* We already know this node. Let's start updating the last
-             * time PONG figure if it is newer than our figure.
-             * Note that it's not a problem if we have a PING already 
-             * in progress against this node. */
-            if (node->pong_received < (signed) ntohl(g->pong_received)) {
-                 redisLog(REDIS_DEBUG,"Node pong_received updated by gossip");
-                node->pong_received = ntohl(g->pong_received);
-            }
-            /* Handle failure reports, only when the sender is a master. */
+            /* We already know this node.
+               Handle failure reports, only when the sender is a master. */
             if (sender && sender->flags & REDIS_NODE_MASTER &&
                 node != server.cluster->myself)
             {
@@ -737,21 +747,55 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
     }
 }
 
-/* IP -> string conversion. 'buf' is supposed to at least be 16 bytes. */
+/* IP -> string conversion. 'buf' is supposed to at least be 46 bytes. */
 void nodeIp2String(char *buf, clusterLink *link) {
-    struct sockaddr_in sa;
+    struct sockaddr_storage sa;
     socklen_t salen = sizeof(sa);
 
     if (getpeername(link->fd, (struct sockaddr*) &sa, &salen) == -1)
         redisPanic("getpeername() failed.");
-    strncpy(buf,inet_ntoa(sa.sin_addr),sizeof(link->node->ip));
+
+    if (sa.ss_family == AF_INET) {
+        struct sockaddr_in *s = (struct sockaddr_in *)&sa;
+        inet_ntop(AF_INET,(void*)&(s->sin_addr),buf,REDIS_CLUSTER_IPLEN);
+    } else {
+        struct sockaddr_in6 *s = (struct sockaddr_in6 *)&sa;
+        inet_ntop(AF_INET6,(void*)&(s->sin6_addr),buf,REDIS_CLUSTER_IPLEN);
+    }
 }
 
 
 /* Update the node address to the IP address that can be extracted
- * from link->fd, and at the specified port. */
-void nodeUpdateAddress(clusterNode *node, clusterLink *link, int port) {
-    /* TODO */
+ * from link->fd, and at the specified port.
+ * Also disconnect the node link so that we'll connect again to the new
+ * address.
+ *
+ * If the ip/port pair are already correct no operation is performed at
+ * all.
+ *
+ * The function returns 0 if the node address is still the same,
+ * otherwise 1 is returned. */
+int nodeUpdateAddressIfNeeded(clusterNode *node, clusterLink *link, int port) {
+    char ip[REDIS_IP_STR_LEN];
+
+    /* We don't proceed if the link is the same as the sender link, as this
+     * function is designed to see if the node link is consistent with the
+     * symmetric link that is used to receive PINGs from the node.
+     *
+     * As a side effect this function never frees the passed 'link', so
+     * it is safe to call during packet processing. */
+    if (link == node->link) return 0;
+
+    nodeIp2String(ip,link);
+    if (node->port == port && strcmp(ip,node->ip) == 0) return 0;
+
+    /* IP / port is different, update it. */
+    memcpy(node->ip,ip,sizeof(ip));
+    node->port = port;
+    if (node->link) freeClusterLink(node->link);
+    redisLog(REDIS_WARNING,"Address updated for node %.40s, now %s:%d",
+        node->name, node->ip, node->port);
+    return 1;
 }
 
 /* When this function is called, there is a packet to process starting
@@ -804,8 +848,9 @@ int clusterProcessPacket(clusterLink *link) {
         if (totlen != explen) return 1;
     }
 
-    /* Ready to process the packet. Dispatch by type. */
+    /* Process packets by type. */
     sender = clusterLookupNode(hdr->sender);
+
     if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_MEET) {
         int update_config = 0;
         redisLog(REDIS_DEBUG,"Ping packet received: %p", (void*)link->node);
@@ -813,7 +858,7 @@ int clusterProcessPacket(clusterLink *link) {
         /* Add this node if it is new for us and the msg type is MEET.
          * In this stage we don't try to add the node with the right
          * flags, slaveof pointer, and so forth, as this details will be
-         * resolved when we'll receive PONGs from the server. */
+         * resolved when we'll receive PONGs from the node. */
         if (!sender && type == CLUSTERMSG_TYPE_MEET) {
             clusterNode *node;
 
@@ -832,11 +877,18 @@ int clusterProcessPacket(clusterLink *link) {
 
         /* Update config if needed */
         if (update_config) clusterSaveConfigOrDie();
-    } else if (type == CLUSTERMSG_TYPE_PONG) {
+    }
+
+    /* PING or PONG: process config information. */
+    if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_PONG ||
+        type == CLUSTERMSG_TYPE_MEET)
+    {
         int update_state = 0;
         int update_config = 0;
 
-        redisLog(REDIS_DEBUG,"Pong packet received: %p", (void*)link->node);
+        redisLog(REDIS_DEBUG,"%s packet received: %p",
+            type == CLUSTERMSG_TYPE_PING ? "ping" : "pong",
+            (void*)link->node);
         if (link->node) {
             if (link->node->flags & REDIS_NODE_HANDSHAKE) {
                 /* If we already have this node, try to change the
@@ -844,8 +896,14 @@ int clusterProcessPacket(clusterLink *link) {
                 if (sender) {
                     redisLog(REDIS_WARNING,
                         "Handshake error: we already know node %.40s, updating the address if needed.", sender->name);
-                    nodeUpdateAddress(sender,link,ntohs(hdr->port));
-                    freeClusterNode(link->node); /* will free the link too */
+                    if (nodeUpdateAddressIfNeeded(sender,link,ntohs(hdr->port)))
+                    {
+                        clusterUpdateState();
+                        clusterSaveConfigOrDie();
+                    }
+                    /* Free this node as we alrady have it. This will
+                     * cause the link to be freed as well. */
+                    freeClusterNode(link->node);
                     return 0;
                 }
 
@@ -855,6 +913,7 @@ int clusterProcessPacket(clusterLink *link) {
                 redisLog(REDIS_DEBUG,"Handshake with node %.40s completed.",
                     link->node->name);
                 link->node->flags &= ~REDIS_NODE_HANDSHAKE;
+                link->node->flags |= flags&(REDIS_NODE_MASTER|REDIS_NODE_SLAVE);
                 update_config = 1;
             } else if (memcmp(link->node->name,hdr->sender,
                         REDIS_CLUSTER_NAMELEN) != 0)
@@ -877,8 +936,33 @@ int clusterProcessPacket(clusterLink *link) {
             }
         }
 
+        /* Update the node address if it changed. */
+        if (sender && type == CLUSTERMSG_TYPE_PING &&
+            !(sender->flags & REDIS_NODE_HANDSHAKE) &&
+            nodeUpdateAddressIfNeeded(sender,link,ntohs(hdr->port)))
+        {
+            update_state = 1;
+            update_config = 1;
+        }
+
         /* Update our info about the node */
-        if (link->node) link->node->pong_received = time(NULL);
+        if (link->node && type == CLUSTERMSG_TYPE_PONG) {
+            link->node->pong_received = time(NULL);
+            link->node->ping_sent = 0;
+
+            /* The PFAIL condition can be reversed without external
+             * help if it is momentary (that is, if it does not
+             * turn into a FAIL state).
+             *
+             * The FAIL condition is also reversible under specific
+             * conditions detected by clearNodeFailureIfNeeded(). */
+            if (link->node->flags & REDIS_NODE_PFAIL) {
+                link->node->flags &= ~REDIS_NODE_PFAIL;
+                update_state = 1;
+            } else if (link->node->flags & REDIS_NODE_FAIL) {
+                clearNodeFailureIfNeeded(link->node);
+            }
+        }
 
         /* Update master/slave state */
         if (sender) {
@@ -908,6 +992,18 @@ int clusterProcessPacket(clusterLink *link) {
                         clusterSetMaster(sender);
                     }
 
+                    /* If we are a slave, and this node used to be a slave
+                     * of our master, and now has the PROMOTED flag set, we
+                     * need to switch our replication setup over it. */
+                    if (flags & REDIS_NODE_PROMOTED &&
+                        server.cluster->myself->flags & REDIS_NODE_SLAVE &&
+                        server.cluster->myself->slaveof == oldmaster)
+                    {
+                        redisLog(REDIS_WARNING,"One of the slaves failed over my master. Reconfiguring myself as a replica of %.40s", sender->name);
+                        clusterDelNodeSlots(server.cluster->myself);
+                        clusterSetMaster(sender);
+                    }
+
                     /* Update config and state. */
                     update_state = 1;
                     update_config = 1;
@@ -932,6 +1028,8 @@ int clusterProcessPacket(clusterLink *link) {
 
                 /* Master node changed for this slave? */
                 if (sender->slaveof != master) {
+                    if (sender->slaveof)
+                        clusterNodeRemoveSlave(sender->slaveof,sender);
                     clusterNodeAddSlave(master,sender);
                     sender->slaveof = master;
                 }
@@ -1008,12 +1106,12 @@ int clusterProcessPacket(clusterLink *link) {
             decrRefCount(message);
         }
     } else if (type == CLUSTERMSG_TYPE_FAILOVER_AUTH_REQUEST) {
-        if (!sender) return 0;  /* We don't know that node. */
+        if (!sender) return 1;  /* We don't know that node. */
         /* If we are not a master, ignore that message at all. */
         if (!(server.cluster->myself->flags & REDIS_NODE_MASTER)) return 0;
         clusterSendFailoverAuthIfNeeded(sender);
     } else if (type == CLUSTERMSG_TYPE_FAILOVER_AUTH_ACK) {
-        if (!sender) return 0;  /* We don't know that node. */
+        if (!sender) return 1;  /* We don't know that node. */
         /* If this is a master, increment the number of acknowledges
          * we received so far. */
         if (sender->flags & REDIS_NODE_MASTER)
@@ -1050,7 +1148,7 @@ void clusterWriteHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
         handleLinkIOError(link);
         return;
     }
-    link->sndbuf = sdsrange(link->sndbuf,nwritten,-1);
+    sdsrange(link->sndbuf,nwritten,-1);
     if (sdslen(link->sndbuf) == 0)
         aeDeleteFileEvent(server.el, link->fd, AE_WRITABLE);
 }
@@ -1162,7 +1260,6 @@ void clusterBuildMessageHdr(clusterMsg *hdr, int type) {
     hdr->port = htons(server.port);
     hdr->flags = htons(server.cluster->myself->flags);
     hdr->state = server.cluster->state;
-    memset(hdr->configdigest,0,32); /* FIXME: set config digest */
 
     if (type == CLUSTERMSG_TYPE_FAIL) {
         totlen = sizeof(clusterMsg)-sizeof(union clusterMsgData);
@@ -1236,14 +1333,13 @@ void clusterSendPing(clusterLink *link, int type) {
     clusterSendMessage(link,buf,totlen);
 }
 
-/* Send a PING packet to every connected node that's not in handshake state.
+/* Send a PONG packet to every connected node that's not in handshake state.
  *
- * Usually cluster nodes will ping just another node every second, however
- * in Redis Cluster pings are not just used for failure detection, but also
- * to carry important configuration informations. So broadcasting a ping is
+ * In Redis Cluster pings are not just used for failure detection, but also
+ * to carry important configuration informations. So broadcasting a pong is
  * useful when something changes in the configuration and we want to make
  * the cluster aware ASAP (for instance after a slave promotion). */
-void clusterBroadcastPing(void) {
+void clusterBroadcastPong(void) {
     dictIterator *di;
     dictEntry *de;
 
@@ -1415,14 +1511,18 @@ void clusterHandleSlaveFailover(void) {
     /* Check if our data is recent enough. For now we just use a fixed
      * constant of ten times the node timeout since the cluster should
      * react much faster to a master down. */
-    if (data_age > server.cluster->node_timeout * 10) return;
+    if (data_age >
+        server.cluster_node_timeout * REDIS_CLUSTER_SLAVE_VALIDITY_MULT)
+        return;
 
     /* TODO: check if we are the first slave as well? Or just rely on the
      * master authorization? */
 
     /* Ask masters if we are authorized to perform the failover. If there
      * is a pending auth request that's too old, reset it. */
-    if (server.cluster->failover_auth_time == 0 || auth_age > 15)
+    if (server.cluster->failover_auth_time == 0 ||
+        auth_age >
+        server.cluster_node_timeout * REDIS_CLUSTER_FAILOVER_AUTH_RETRY_MULT)
     {
         redisLog(REDIS_WARNING,"Asking masters if I can failover...");
         server.cluster->failover_auth_time = time(NULL);
@@ -1457,9 +1557,9 @@ void clusterHandleSlaveFailover(void) {
             }
         }
 
-        /* 3) Ping all the other nodes so that they can update the state
+        /* 3) Pong all the other nodes so that they can update the state
          *    accordingly and detect that we switched to master role. */
-        clusterBroadcastPing();
+        clusterBroadcastPong();
 
         /* 4) Update state and save config. */
         clusterUpdateState();
@@ -1476,17 +1576,18 @@ void clusterCron(void) {
     dictIterator *di;
     dictEntry *de;
     int j, update_state = 0;
-    time_t min_ping_sent = 0;
-    clusterNode *min_ping_node = NULL;
+    time_t min_pong = 0;
+    clusterNode *min_pong_node = NULL;
 
     /* Check if we have disconnected nodes and re-establish the connection. */
-    di = dictGetIterator(server.cluster->nodes);
+    di = dictGetSafeIterator(server.cluster->nodes);
     while((de = dictNext(di)) != NULL) {
         clusterNode *node = dictGetVal(de);
 
         if (node->flags & (REDIS_NODE_MYSELF|REDIS_NODE_NOADDR)) continue;
         if (node->link == NULL) {
             int fd;
+            time_t old_ping_sent;
             clusterLink *link;
 
             fd = anetTcpNonBlockConnect(server.neterr, node->ip,
@@ -1496,11 +1597,21 @@ void clusterCron(void) {
             link->fd = fd;
             node->link = link;
             aeCreateFileEvent(server.el,link->fd,AE_READABLE,clusterReadHandler,link);
-            /* If the node is flagged as MEET, we send a MEET message instead
+            /* Queue a PING in the new connection ASAP: this is crucial
+             * to avoid false positives in failure detection.
+             *
+             * If the node is flagged as MEET, we send a MEET message instead
              * of a PING one, to force the receiver to add us in its node
              * table. */
+            old_ping_sent = node->ping_sent;
             clusterSendPing(link, node->flags & REDIS_NODE_MEET ?
                     CLUSTERMSG_TYPE_MEET : CLUSTERMSG_TYPE_PING);
+            if (old_ping_sent) {
+                /* If there was an active ping before the link was
+                 * disconnected, we want to restore the ping time, otherwise
+                 * replaced by the clusterSendPing() call. */
+                node->ping_sent = old_ping_sent;
+            }
             /* We can clear the flag after the first packet is sent.
              * If we'll never receive a PONG, we'll never send new packets
              * to this node. Instead after the PONG is received and we
@@ -1514,21 +1625,22 @@ void clusterCron(void) {
     dictReleaseIterator(di);
 
     /* Ping some random node. Check a few random nodes and ping the one with
-     * the oldest ping_sent time */
+     * the oldest pong_received time */
     for (j = 0; j < 5; j++) {
         de = dictGetRandomKey(server.cluster->nodes);
         clusterNode *this = dictGetVal(de);
 
-        if (this->link == NULL) continue;
+        /* Don't ping nodes disconnected or with a ping currently active. */
+        if (this->link == NULL || this->ping_sent != 0) continue;
         if (this->flags & (REDIS_NODE_MYSELF|REDIS_NODE_HANDSHAKE)) continue;
-        if (min_ping_node == NULL || min_ping_sent > this->ping_sent) {
-            min_ping_node = this;
-            min_ping_sent = this->ping_sent;
+        if (min_pong_node == NULL || min_pong > this->pong_received) {
+            min_pong_node = this;
+            min_pong = this->pong_received;
         }
     }
-    if (min_ping_node) {
-        redisLog(REDIS_DEBUG,"Pinging node %40s", min_ping_node->name);
-        clusterSendPing(min_ping_node->link, CLUSTERMSG_TYPE_PING);
+    if (min_pong_node) {
+        redisLog(REDIS_DEBUG,"Pinging node %.40s", min_pong_node->name);
+        clusterSendPing(min_pong_node->link, CLUSTERMSG_TYPE_PING);
     }
 
     /* Iterate nodes to check if we need to flag something as failing */
@@ -1542,42 +1654,42 @@ void clusterCron(void) {
             (REDIS_NODE_MYSELF|REDIS_NODE_NOADDR|REDIS_NODE_HANDSHAKE))
                 continue;
 
-        /* Check only if we already sent a ping and did not received
-         * a reply yet. */
-        if (node->ping_sent == 0 ||
-            node->ping_sent <= node->pong_received) continue;
+        /* If we are waiting for the PONG more than half the cluster
+         * timeout, reconnect the link: maybe there is a connection
+         * issue even if the node is alive. */
+        if (node->link && /* is connected */
+            time(NULL) - node->link->ctime >
+            server.cluster_node_timeout && /* was not already reconnected */
+            node->ping_sent && /* we already sent a ping */
+            node->pong_received < node->ping_sent && /* still waiting pong */
+            /* and we are waiting for the pong more than timeout/2 */
+            now - node->ping_sent > server.cluster_node_timeout/2)
+        {
+            /* Disconnect the link, it will be reconnected automatically. */
+            freeClusterLink(node->link);
+        }
 
-        /* If our ping is older than half the cluster timeout (may happen
-         * in a cluster with many nodes), send a new ping. */
+        /* If we have currently no active ping in this instance, and the
+         * received PONG is older than half the cluster timeout, send
+         * a new ping now, to ensure all the nodes are pinged without
+         * a too big delay. */
         if (node->link &&
-            (now - node->ping_sent) > server.cluster->node_timeout/2)
+            node->ping_sent == 0 &&
+            (now - node->pong_received) > server.cluster_node_timeout/2)
         {
             clusterSendPing(node->link, CLUSTERMSG_TYPE_PING);
             continue;
         }
 
-        /* If we never received a pong, use the ping time to compute
-         * the delay. */
-        if (node->pong_received) {
-            delay = now - node->pong_received;
-        } else {
-            delay = now - node->ping_sent;
-        }
+        /* Check only if we have an active ping for this instance. */
+        if (node->ping_sent == 0) continue;
 
-        if (delay < server.cluster->node_timeout) {
-            /* The PFAIL condition can be reversed without external
-             * help if it is not transitive (that is, if it does not
-             * turn into a FAIL state).
-             *
-             * The FAIL condition is also reversible under specific
-             * conditions detected by clearNodeFailureIfNeeded(). */
-            if (node->flags & REDIS_NODE_PFAIL) {
-                node->flags &= ~REDIS_NODE_PFAIL;
-                update_state = 1;
-            } else if (node->flags & REDIS_NODE_FAIL) {
-                clearNodeFailureIfNeeded(node);
-            }
-        } else {
+        /* Compute the delay of the PONG. Note that if we already received
+         * the PONG, then node->ping_sent is zero, so can't reach this
+         * code at all. */
+        delay = now - node->ping_sent;
+
+        if (delay > server.cluster_node_timeout) {
             /* Timeout reached. Set the node as possibly failing if it is
              * not already in this state. */
             if (!(node->flags & (REDIS_NODE_PFAIL|REDIS_NODE_FAIL))) {
@@ -1959,11 +2071,19 @@ void clusterCommand(redisClient *c) {
     if (!strcasecmp(c->argv[1]->ptr,"meet") && c->argc == 4) {
         /* CLUSTER MEET <ip> <port> */
         clusterNode *n;
-        struct sockaddr_in sa;
+        struct sockaddr_storage sa;
         long port;
 
         /* Perform sanity checks on IP/port */
-        if (inet_aton(c->argv[2]->ptr,&sa.sin_addr) == 0) {
+        if (inet_pton(AF_INET,c->argv[2]->ptr,
+            &(((struct sockaddr_in *)&sa)->sin_addr)))
+        {
+            sa.ss_family = AF_INET;
+        } else if (inet_pton(AF_INET6,c->argv[2]->ptr,
+            &(((struct sockaddr_in6 *)&sa)->sin6_addr)))
+        {
+            sa.ss_family = AF_INET6;
+        } else {
             addReplyError(c,"Invalid IP address in MEET");
             return;
         }
@@ -1977,7 +2097,17 @@ void clusterCommand(redisClient *c) {
         /* Finally add the node to the cluster with a random name, this 
          * will get fixed in the first handshake (ping/pong). */
         n = createClusterNode(NULL,REDIS_NODE_HANDSHAKE|REDIS_NODE_MEET);
-        strncpy(n->ip,inet_ntoa(sa.sin_addr),sizeof(n->ip));
+
+        /* Set node->ip as the normalized string representation of the node
+         * IP address. */
+        if (sa.ss_family == AF_INET)
+            inet_ntop(AF_INET,
+                (void*)&(((struct sockaddr_in *)&sa)->sin_addr),
+                n->ip,REDIS_CLUSTER_IPLEN);
+        else
+            inet_ntop(AF_INET6,
+                (void*)&(((struct sockaddr_in6 *)&sa)->sin6_addr),
+                n->ip,REDIS_CLUSTER_IPLEN);
         n->port = port;
         clusterAddNode(n);
         addReply(c,shared.ok);
@@ -2572,7 +2702,7 @@ try_again:
             rioWriteBulkString(&cmd,"RESTORE-ASKING",14));
     else
         redisAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,"RESTORE",7));
-    redisAssertWithInfo(c,NULL,c->argv[3]->encoding == REDIS_ENCODING_RAW);
+    redisAssertWithInfo(c,NULL,sdsEncodedObject(c->argv[3]));
     redisAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,c->argv[3]->ptr,sdslen(c->argv[3]->ptr)));
     redisAssertWithInfo(c,NULL,rioWriteBulkLongLong(&cmd,ttl));
 

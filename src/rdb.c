@@ -326,7 +326,7 @@ int rdbSaveStringObject(rio *rdb, robj *obj) {
     if (obj->encoding == REDIS_ENCODING_INT) {
         return rdbSaveLongLongAsStringObject(rdb,(long)obj->ptr);
     } else {
-        redisAssertWithInfo(NULL,obj,obj->encoding == REDIS_ENCODING_RAW);
+        redisAssertWithInfo(NULL,obj,sdsEncodedObject(obj));
         return rdbSaveRawString(rdb,obj->ptr,sdslen(obj->ptr));
     }
 }
@@ -752,14 +752,14 @@ int rdbSaveBackground(char *filename) {
     if (server.rdb_child_pid != -1) return REDIS_ERR;
 
     server.dirty_before_bgsave = server.dirty;
+    server.lastbgsave_try = time(NULL);
 
     start = ustime();
     if ((childpid = fork()) == 0) {
         int retval;
 
         /* Child */
-        if (server.ipfd > 0) close(server.ipfd);
-        if (server.sofd > 0) close(server.sofd);
+        closeListeningSockets(0);
         redisSetProcTitle("redis-rdb-bgsave");
         retval = rdbSave(filename);
         if (retval == REDIS_OK) {
@@ -767,7 +767,7 @@ int rdbSaveBackground(char *filename) {
 
             if (private_dirty) {
                 redisLog(REDIS_NOTICE,
-                    "RDB: %lu MB of memory used by copy-on-write",
+                    "RDB: %zu MB of memory used by copy-on-write",
                     private_dirty/(1024*1024));
             }
         }
@@ -776,6 +776,7 @@ int rdbSaveBackground(char *filename) {
         /* Parent */
         server.stat_fork_time = ustime()-start;
         if (childpid == -1) {
+            server.lastbgsave_status = REDIS_ERR;
             redisLog(REDIS_WARNING,"Can't save in background: fork: %s",
                 strerror(errno));
             return REDIS_ERR;
@@ -825,7 +826,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb) {
             /* If we are using a ziplist and the value is too big, convert
              * the object to a real list. */
             if (o->encoding == REDIS_ENCODING_ZIPLIST &&
-                ele->encoding == REDIS_ENCODING_RAW &&
+                sdsEncodedObject(ele) &&
                 sdslen(ele->ptr) > server.list_max_ziplist_value)
                     listTypeConvert(o,REDIS_ENCODING_LINKEDLIST);
 
@@ -899,9 +900,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb) {
             if (rdbLoadDoubleValue(rdb,&score) == -1) return NULL;
 
             /* Don't care about integer-encoded strings. */
-            if (ele->encoding == REDIS_ENCODING_RAW &&
-                sdslen(ele->ptr) > maxelelen)
-                    maxelelen = sdslen(ele->ptr);
+            if (sdsEncodedObject(ele) && sdslen(ele->ptr) > maxelelen)
+                maxelelen = sdslen(ele->ptr);
 
             znode = zslInsert(zs->zsl,score,ele);
             dictAdd(zs->dict,ele,&znode->score);
@@ -933,10 +933,10 @@ robj *rdbLoadObject(int rdbtype, rio *rdb) {
             /* Load raw strings */
             field = rdbLoadStringObject(rdb);
             if (field == NULL) return NULL;
-            redisAssert(field->encoding == REDIS_ENCODING_RAW);
+            redisAssert(sdsEncodedObject(field));
             value = rdbLoadStringObject(rdb);
             if (value == NULL) return NULL;
-            redisAssert(field->encoding == REDIS_ENCODING_RAW);
+            redisAssert(sdsEncodedObject(value));
 
             /* Add pair to ziplist */
             o->ptr = ziplistPush(o->ptr, field->ptr, sdslen(field->ptr), ZIPLIST_TAIL);
@@ -1090,21 +1090,33 @@ void stopLoading(void) {
     server.loading = 0;
 }
 
+/* Track loading progress in order to serve client's from time to time
+   and if needed calculate rdb checksum  */
+void rdbLoadProgressCallback(rio *r, const void *buf, size_t len) {
+    if (server.rdb_checksum)
+        rioGenericUpdateChecksum(r, buf, len);
+    if (server.loading_process_events_interval_bytes &&
+        (r->processed_bytes + len)/server.loading_process_events_interval_bytes > r->processed_bytes/server.loading_process_events_interval_bytes) {
+        loadingProgress(r->processed_bytes);
+        aeProcessEvents(server.el, AE_FILE_EVENTS|AE_DONT_WAIT);
+    }
+}
+
 int rdbLoad(char *filename) {
     uint32_t dbid;
     int type, rdbver;
     redisDb *db = server.db+0;
     char buf[1024];
     long long expiretime, now = mstime();
-    long loops = 0;
     FILE *fp;
     rio rdb;
+    int loops = 0;
 
     if ((fp = fopen(filename,"r")) == NULL) return REDIS_ERR;
 
     rioInitWithFile(&rdb,fp);
-    if (server.rdb_checksum)
-        rdb.update_cksum = rioGenericUpdateChecksum;
+    rdb.update_cksum = rdbLoadProgressCallback;
+    rdb.max_processing_chunk = server.loading_process_events_interval_bytes;
     if (rioRead(&rdb,buf,9) == 0) goto eoferr;
     buf[9] = '\0';
     if (memcmp(buf,"REDIS",5) != 0) {

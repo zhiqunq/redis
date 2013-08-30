@@ -58,8 +58,8 @@ static int getBitOffsetFromArgument(redisClient *c, robj *o, size_t *offset) {
 /* Count number of bits set in the binary array pointed by 's' and long
  * 'count' bytes. The implementation of this function is required to
  * work with a input string length up to 512 MB. */
-long popcount(void *s, long count) {
-    long bits = 0;
+size_t redisPopcount(void *s, long count) {
+    size_t bits = 0;
     unsigned char *p;
     uint32_t *p4 = s;
     static const unsigned char bitsinbyte[256] = {0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4,1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,4,5,5,6,5,6,6,7,5,6,6,7,6,7,7,8};
@@ -133,7 +133,7 @@ void setbitCommand(redisClient *c) {
         /* Create a copy when the object is shared or encoded. */
         if (o->refcount != 1 || o->encoding != REDIS_ENCODING_RAW) {
             robj *decoded = getDecodedObject(o);
-            o = createStringObject(decoded->ptr, sdslen(decoded->ptr));
+            o = createRawStringObject(decoded->ptr, sdslen(decoded->ptr));
             decrRefCount(decoded);
             dbOverwrite(c->db,c->argv[1],o);
         }
@@ -174,12 +174,12 @@ void getbitCommand(redisClient *c) {
 
     byte = bitoffset >> 3;
     bit = 7 - (bitoffset & 0x7);
-    if (o->encoding != REDIS_ENCODING_RAW) {
-        if (byte < (size_t)ll2string(llbuf,sizeof(llbuf),(long)o->ptr))
-            bitval = llbuf[byte] & (1 << bit);
-    } else {
+    if (sdsEncodedObject(o)) {
         if (byte < sdslen(o->ptr))
             bitval = ((uint8_t*)o->ptr)[byte] & (1 << bit);
+    } else {
+        if (byte < (size_t)ll2string(llbuf,sizeof(llbuf),(long)o->ptr))
+            bitval = llbuf[byte] & (1 << bit);
     }
 
     addReply(c, bitval ? shared.cone : shared.czero);
@@ -407,6 +407,6 @@ void bitcountCommand(redisClient *c) {
     } else {
         long bytes = end-start+1;
 
-        addReplyLongLong(c,popcount(p+start,bytes));
+        addReplyLongLong(c,redisPopcount(p+start,bytes));
     }
 }

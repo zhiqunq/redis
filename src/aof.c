@@ -591,7 +591,7 @@ int rioWriteBulkObject(rio *r, robj *obj) {
      * in a child process when this function is called). */
     if (obj->encoding == REDIS_ENCODING_INT) {
         return rioWriteBulkLongLong(r,(long)obj->ptr);
-    } else if (obj->encoding == REDIS_ENCODING_RAW) {
+    } else if (sdsEncodedObject(obj)) {
         return rioWriteBulkString(r,obj->ptr,sdslen(obj->ptr));
     } else {
         redisPanic("Unknown string encoding");
@@ -855,6 +855,8 @@ int rewriteAppendOnlyFile(char *filename) {
     }
 
     rioInitWithFile(&aof,fp);
+    if (server.aof_rewrite_incremental_fsync)
+        rioSetAutoSync(&aof,REDIS_AOF_AUTOSYNC_BYTES);
     for (j = 0; j < server.dbnum; j++) {
         char selectcmd[] = "*2\r\n$6\r\nSELECT\r\n";
         redisDb *db = server.db+j;
@@ -882,6 +884,9 @@ int rewriteAppendOnlyFile(char *filename) {
 
             expiretime = getExpire(db,&key);
 
+            /* If this key is already expired skip it */
+            if (expiretime != -1 && expiretime < now) continue;
+
             /* Save the key and associated value */
             if (o->type == REDIS_STRING) {
                 /* Emit a SET command */
@@ -904,8 +909,6 @@ int rewriteAppendOnlyFile(char *filename) {
             /* Save the expire time */
             if (expiretime != -1) {
                 char cmd[]="*3\r\n$9\r\nPEXPIREAT\r\n";
-                /* If this key is already expired skip it */
-                if (expiretime < now) continue;
                 if (rioWrite(&aof,cmd,sizeof(cmd)-1) == 0) goto werr;
                 if (rioWriteBulkObject(&aof,&key) == 0) goto werr;
                 if (rioWriteBulkLongLong(&aof,expiretime) == 0) goto werr;
@@ -959,8 +962,7 @@ int rewriteAppendOnlyFileBackground(void) {
         char tmpfile[256];
 
         /* Child */
-        if (server.ipfd > 0) close(server.ipfd);
-        if (server.sofd > 0) close(server.sofd);
+        closeListeningSockets(0);
         redisSetProcTitle("redis-aof-rewrite");
         snprintf(tmpfile,256,"temp-rewriteaof-bg-%d.aof", (int) getpid());
         if (rewriteAppendOnlyFile(tmpfile) == REDIS_OK) {
@@ -968,7 +970,7 @@ int rewriteAppendOnlyFileBackground(void) {
 
             if (private_dirty) {
                 redisLog(REDIS_NOTICE,
-                    "AOF rewrite: %lu MB of memory used by copy-on-write",
+                    "AOF rewrite: %zu MB of memory used by copy-on-write",
                     private_dirty/(1024*1024));
             }
             exitFromChild(0);
@@ -995,6 +997,7 @@ int rewriteAppendOnlyFileBackground(void) {
          * accumulated by the parent into server.aof_rewrite_buf will start
          * with a SELECT statement and it will be safe to merge. */
         server.aof_selected_db = -1;
+        replicationScriptCacheFlush();
         return REDIS_OK;
     }
     return REDIS_OK; /* unreached */

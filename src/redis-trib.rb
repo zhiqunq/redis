@@ -27,7 +27,24 @@ require 'redis'
 ClusterHashSlots = 16384
 
 def xputs(s)
-    puts s
+    case s[0..2]
+    when ">>>"
+        color="29;1"
+    when "[ER"
+        color="31;1"
+    when "[OK"
+        color="32"
+    when "[FA","***"
+        color="33"
+    else
+        color=nil
+    end
+
+    color = nil if ENV['TERM'] != "xterm"
+    print "\033[#{color}m" if color
+    print s
+    print "\033[0m" if color
+    print "\n"
 end
 
 class ClusterNode
@@ -200,7 +217,10 @@ class ClusterNode
             x.count == 1 ? x.first.to_s : "#{x.first}-#{x.last}"
         }.join(",")
 
-        "[#{@info[:cluster_state].upcase} #{(self.info[:flags]-["myself"]).join(",")}] #{self.info[:name]} #{self.to_s} slots:#{slots} (#{self.slots.length} slots)"
+        role = self.has_flag?("master") ? "M" : "S"
+        "#{role}: #{self.info[:name]} #{self.to_s}\n"+
+        "   slots:#{slots} (#{self.slots.length} slots) "+
+        "#{(self.info[:flags]-["myself"]).join(",")}"
     end
 
     # Return a single string representing nodes and associated slots.
@@ -414,15 +434,29 @@ class RedisTrib
 
     # Check if all the nodes agree about the cluster configuration
     def check_config_consistency
-        signatures=[]
-        @nodes.each{|n|
-            signatures << n.get_config_signature
-        }
-        if signatures.uniq.length != 1
+        if !is_config_consistent?
             cluster_error "[ERR] Nodes don't agree about configuration!"
         else
             xputs "[OK] All nodes agree about slots configuration."
         end
+    end
+
+    def is_config_consistent?
+        signatures=[]
+        @nodes.each{|n|
+            signatures << n.get_config_signature
+        }
+        return signatures.uniq.length == 1
+    end
+
+    def wait_cluster_join
+        print "Waiting for the cluster to join"
+        while !is_config_consistent?
+            print "."
+            STDOUT.flush
+            sleep 1
+        end
+        print "\n"
     end
 
     def alloc_slots
@@ -651,6 +685,11 @@ class RedisTrib
         xputs ">>> Nodes configuration updated"
         xputs ">>> Sending CLUSTER MEET messages to join the cluster"
         join_cluster
+        # Give one second for the join to start, in order to avoid that
+        # wait_cluster_join will find all the nodes agree about the config as
+        # they are still empty with unassigned slots.
+        sleep 1
+        wait_cluster_join
         check_cluster
     end
 

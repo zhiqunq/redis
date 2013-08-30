@@ -449,6 +449,12 @@ void shutdownCommand(redisClient *c) {
             return;
         }
     }
+    /* SHUTDOWN can be called even while the server is in "loading" state.
+     * When this happens we need to make sure no attempt is performed to save
+     * the dataset on shutdown (otherwise it could overwrite the current DB
+     * with half-read data). */
+    if (server.loading)
+        flags = (flags & ~REDIS_SHUTDOWN_SAVE) | REDIS_SHUTDOWN_NOSAVE;
     if (prepareForShutdown(flags) == REDIS_OK) exit(0);
     addReplyError(c,"Errors trying to SHUTDOWN. Check logs.");
 }
@@ -649,7 +655,6 @@ int expireIfNeeded(redisDb *db, robj *key) {
  * unit is either UNIT_SECONDS or UNIT_MILLISECONDS, and is only used for
  * the argv[2] parameter. The basetime is always specified in milliseconds. */
 void expireGenericCommand(redisClient *c, long long basetime, int unit) {
-    dictEntry *de;
     robj *key = c->argv[1], *param = c->argv[2];
     long long when; /* unix time in milliseconds when the key will expire. */
 
@@ -659,11 +664,12 @@ void expireGenericCommand(redisClient *c, long long basetime, int unit) {
     if (unit == UNIT_SECONDS) when *= 1000;
     when += basetime;
 
-    de = dictFind(c->db->dict,key->ptr);
-    if (de == NULL) {
+    /* No key, return zero. */
+    if (lookupKeyRead(c->db,key) == NULL) {
         addReply(c,shared.czero);
         return;
     }
+
     /* EXPIRE with negative TTL, or EXPIREAT with a timestamp into the past
      * should never be executed as a DEL when load the AOF or in the context
      * of a slave instance.
@@ -713,17 +719,17 @@ void pexpireatCommand(redisClient *c) {
 void ttlGenericCommand(redisClient *c, int output_ms) {
     long long expire, ttl = -1;
 
-    expire = getExpire(c->db,c->argv[1]);
     /* If the key does not exist at all, return -2 */
-    if (expire == -1 && lookupKeyRead(c->db,c->argv[1]) == NULL) {
+    if (lookupKeyRead(c->db,c->argv[1]) == NULL) {
         addReplyLongLong(c,-2);
         return;
     }
     /* The key exists. Return -1 if it has no expire, or the actual
      * TTL value otherwise. */
+    expire = getExpire(c->db,c->argv[1]);
     if (expire != -1) {
         ttl = expire-mstime();
-        if (ttl < 0) ttl = -1;
+        if (ttl < 0) ttl = 0;
     }
     if (ttl == -1) {
         addReplyLongLong(c,-1);
