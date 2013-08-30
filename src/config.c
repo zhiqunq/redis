@@ -325,6 +325,12 @@ void loadServerConfigFromString(char *config) {
             if ((server.nds_preload = yesnotoi(argv[1])) == -1) {
                 err = "argument must be 'yes' or 'no'"; goto loaderr;
             }
+        } else if (!strcasecmp(argv[0],"aof-rewrite-incremental-fsync") &&
+                   argc == 2)
+        {
+            if ((server.aof_rewrite_incremental_fsync = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
         } else if (!strcasecmp(argv[0],"requirepass") && argc == 2) {
             if (strlen(argv[1]) > REDIS_AUTHPASS_MAX_LEN) {
                 err = "Password is longer than REDIS_AUTHPASS_MAX_LEN";
@@ -495,7 +501,7 @@ void configSetCommand(redisClient *c) {
         server.requirepass = ((char*)o->ptr)[0] ? zstrdup(o->ptr) : NULL;
     } else if (!strcasecmp(c->argv[2]->ptr,"masterauth")) {
         zfree(server.masterauth);
-        server.masterauth = zstrdup(o->ptr);
+        server.masterauth = ((char*)o->ptr)[0] ? zstrdup(o->ptr) : NULL;
     } else if (!strcasecmp(c->argv[2]->ptr,"maxmemory")) {
         if (getLongLongFromObject(o,&ll) == REDIS_ERR ||
             ll < 0) goto badfmt;
@@ -574,6 +580,11 @@ void configSetCommand(redisClient *c) {
     } else if (!strcasecmp(c->argv[2]->ptr,"auto-aof-rewrite-min-size")) {
         if (getLongLongFromObject(o,&ll) == REDIS_ERR || ll < 0) goto badfmt;
         server.aof_rewrite_min_size = ll;
+    } else if (!strcasecmp(c->argv[2]->ptr,"aof-rewrite-incremental-fsync")) {
+        int yn = yesnotoi(o->ptr);
+
+        if (yn == -1) goto badfmt;
+        server.aof_rewrite_incremental_fsync = yn;
     } else if (!strcasecmp(c->argv[2]->ptr,"save")) {
         int vlen, j;
         sds *v = sdssplitlen(o->ptr,sdslen(o->ptr)," ",1,&vlen);
@@ -797,7 +808,7 @@ void configGetCommand(redisClient *c) {
     /* String values */
     config_get_string_field("dbfilename",server.rdb_filename);
     config_get_string_field("requirepass",server.requirepass);
-    config_get_string_field("masterauth",server.requirepass);
+    config_get_string_field("masterauth",server.masterauth);
     config_get_string_field("bind",server.bindaddr);
     config_get_string_field("unixsocket",server.unixsocket);
     config_get_string_field("logfile",server.logfile);
@@ -857,6 +868,8 @@ void configGetCommand(redisClient *c) {
             server.repl_disable_tcp_nodelay);
     config_get_bool_field("nds", server.nds);
     config_get_bool_field("nds-preload", server.nds_preload);
+    config_get_bool_field("aof-rewrite-incremental-fsync",
+            server.aof_rewrite_incremental_fsync);
 
     /* Everything we can't handle with macros follows. */
 

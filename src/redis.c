@@ -115,7 +115,7 @@ struct redisCommand *commandTable;
  */
 struct redisCommand redisCommandTable[] = {
     {"get",getCommand,2,"r",0,NULL,1,1,1,0,0},
-    {"set",setCommand,3,"wm",0,noPreloadGetKeys,1,1,1,0,0},
+    {"set",setCommand,-3,"wm",0,noPreloadGetKeys,1,1,1,0,0},
     {"setnx",setnxCommand,3,"wm",0,noPreloadGetKeys,1,1,1,0,0},
     {"setex",setexCommand,4,"wm",0,noPreloadGetKeys,1,1,1,0,0},
     {"psetex",psetexCommand,4,"wm",0,noPreloadGetKeys,1,1,1,0,0},
@@ -198,7 +198,7 @@ struct redisCommand redisCommandTable[] = {
     {"mset",msetCommand,-3,"wm",0,NULL,1,-1,2,0,0},
     {"msetnx",msetnxCommand,-3,"wm",0,NULL,1,-1,2,0,0},
     {"randomkey",randomkeyCommand,1,"rR",0,NULL,0,0,0,0,0},
-    {"select",selectCommand,2,"r",0,NULL,0,0,0,0,0},
+    {"select",selectCommand,2,"rl",0,NULL,0,0,0,0,0},
     {"move",moveCommand,3,"w",0,NULL,1,1,1,0,0},
     {"rename",renameCommand,3,"w",0,renameGetKeys,1,2,1,0,0},
     {"renamenx",renamenxCommand,3,"w",0,renameGetKeys,1,2,1,0,0},
@@ -238,7 +238,7 @@ struct redisCommand redisCommandTable[] = {
     {"unsubscribe",unsubscribeCommand,-1,"rpslt",0,NULL,0,0,0,0,0},
     {"psubscribe",psubscribeCommand,-2,"rpslt",0,NULL,0,0,0,0,0},
     {"punsubscribe",punsubscribeCommand,-1,"rpslt",0,NULL,0,0,0,0,0},
-    {"publish",publishCommand,3,"pflt",0,NULL,0,0,0,0,0},
+    {"publish",publishCommand,3,"pfltr",0,NULL,0,0,0,0,0},
     {"watch",watchCommand,-2,"rs",0,noPreloadGetKeys,1,-1,1,0,0},
     {"unwatch",unwatchCommand,1,"rs",0,NULL,0,0,0,0,0},
     {"restore",restoreCommand,4,"awm",0,NULL,1,1,1,0,0},
@@ -615,22 +615,74 @@ void updateDictResizePolicy(void) {
 
 /* ======================= Cron: called every 100 ms ======================== */
 
+/* Helper function for the activeExpireCycle() function.
+ * This function will try to expire the key that is stored in the hash table
+ * entry 'de' of the 'expires' hash table of a Redis database.
+ *
+ * If the key is found to be expired, it is removed from the database and
+ * 1 is returned. Otherwise no operation is performed and 0 is returned.
+ *
+ * When a key is expired, server.stat_expiredkeys is incremented.
+ *
+ * The parameter 'now' is the current time in milliseconds as is passed
+ * to the function to avoid too many gettimeofday() syscalls. */
+int activeExpireCycleTryExpire(redisDb *db, struct dictEntry *de, long long now) {
+    long long t = dictGetSignedIntegerVal(de);
+    if (now > t) {
+        sds key = dictGetKey(de);
+        robj *keyobj = createStringObject(key,sdslen(key));
+
+        propagateExpire(db,keyobj);
+        dbDelete(db,keyobj);
+        decrRefCount(keyobj);
+        server.stat_expiredkeys++;
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
 /* Try to expire a few timed out keys. The algorithm used is adaptive and
  * will use few CPU cycles if there are few expiring keys, otherwise
  * it will get more aggressive to avoid that too much memory is used by
  * keys that can be removed from the keyspace.
  *
  * No more than REDIS_DBCRON_DBS_PER_CALL databases are tested at every
- * iteration. */
-void activeExpireCycle(void) {
+ * iteration.
+ *
+ * This kind of call is used when Redis detects that timelimit_exit is
+ * true, so there is more work to do, and we do it more incrementally from
+ * the beforeSleep() function of the event loop.
+ *
+ * Expire cycle type:
+ *
+ * If type is ACTIVE_EXPIRE_CYCLE_FAST the function will try to run a
+ * "fast" expire cycle that takes no longer than EXPIRE_FAST_CYCLE_DURATION
+ * microseconds, and is not repeated again before the same amount of time.
+ *
+ * If type is ACTIVE_EXPIRE_CYCLE_SLOW, that normal expire cycle is
+ * executed, where the time limit is a percentage of the REDIS_HZ period
+ * as specified by the REDIS_EXPIRELOOKUPS_TIME_PERC define. */
+
+void activeExpireCycle(int type) {
     /* This function has some global state in order to continue the work
      * incrementally across calls. */
     static unsigned int current_db = 0; /* Last DB tested. */
     static int timelimit_exit = 0;      /* Time limit hit in previous call? */
+    static long long last_fast_cycle = 0; /* When last fast cycle ran. */
 
     unsigned int j, iteration = 0;
     unsigned int dbs_per_call = REDIS_DBCRON_DBS_PER_CALL;
     long long start = ustime(), timelimit;
+
+    if (type == ACTIVE_EXPIRE_CYCLE_FAST) {
+        /* Don't start a fast cycle if the previous cycle did not exited
+         * for time limt. Also don't repeat a fast cycle for the same period
+         * as the fast cycle total duration itself. */
+        if (!timelimit_exit) return;
+        if (start < last_fast_cycle + ACTIVE_EXPIRE_CYCLE_FAST_DURATION*2) return;
+        last_fast_cycle = start;
+    }
 
     /* We usually should test REDIS_DBCRON_DBS_PER_CALL per iteration, with
      * two exceptions:
@@ -642,13 +694,16 @@ void activeExpireCycle(void) {
     if (dbs_per_call > server.dbnum || timelimit_exit)
         dbs_per_call = server.dbnum;
 
-    /* We can use at max REDIS_EXPIRELOOKUPS_TIME_PERC percentage of CPU time
+    /* We can use at max ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC percentage of CPU time
      * per iteration. Since this function gets called with a frequency of
      * server.hz times per second, the following is the max amount of
      * microseconds we can spend in this function. */
-    timelimit = 1000000*REDIS_EXPIRELOOKUPS_TIME_PERC/server.hz/100;
+    timelimit = 1000000*ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC/server.hz/100;
     timelimit_exit = 0;
     if (timelimit <= 0) timelimit = 1;
+
+    if (type == ACTIVE_EXPIRE_CYCLE_FAST)
+        timelimit = ACTIVE_EXPIRE_CYCLE_FAST_DURATION; /* in microseconds. */
 
     for (j = 0; j < dbs_per_call; j++) {
         int expired;
@@ -663,10 +718,14 @@ void activeExpireCycle(void) {
          * of the keys were expired. */
         do {
             unsigned long num, slots;
-            long long now;
+            long long now, ttl_sum;
+            int ttl_samples;
 
             /* If there is nothing to expire try next DB ASAP. */
-            if ((num = dictSize(db->expires)) == 0) break;
+            if ((num = dictSize(db->expires)) == 0) {
+                db->avg_ttl = 0;
+                break;
+            }
             slots = dictSlots(db->expires);
             now = mstime();
 
@@ -679,25 +738,33 @@ void activeExpireCycle(void) {
             /* The main collection cycle. Sample random keys among keys
              * with an expire set, checking for expired ones. */
             expired = 0;
-            if (num > REDIS_EXPIRELOOKUPS_PER_CRON)
-                num = REDIS_EXPIRELOOKUPS_PER_CRON;
+            ttl_sum = 0;
+            ttl_samples = 0;
+
+            if (num > ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP)
+                num = ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP;
+
             while (num--) {
                 dictEntry *de;
-                long long t;
+                long long ttl;
 
                 if ((de = dictGetRandomKey(db->expires)) == NULL) break;
-                t = dictGetSignedIntegerVal(de);
-                if (now > t) {
-                    sds key = dictGetKey(de);
-                    robj *keyobj = createStringObject(key,sdslen(key));
-
-                    propagateExpire(db,keyobj);
-                    dbDelete(db,keyobj);
-                    decrRefCount(keyobj);
-                    expired++;
-                    server.stat_expiredkeys++;
-                }
+                ttl = dictGetSignedIntegerVal(de)-now;
+                if (activeExpireCycleTryExpire(db,de,now)) expired++;
+                if (ttl < 0) ttl = 0;
+                ttl_sum += ttl;
+                ttl_samples++;
             }
+
+            /* Update the average TTL stats for this database. */
+            if (ttl_samples) {
+                long long avg_ttl = ttl_sum/ttl_samples;
+
+                if (db->avg_ttl == 0) db->avg_ttl = avg_ttl;
+                /* Smooth the value averaging with the previous one. */
+                db->avg_ttl = (db->avg_ttl+avg_ttl)/2;
+            }
+
             /* We can't block forever here even if there are many keys to
              * expire. So after a given amount of milliseconds return to the
              * caller waiting for the other active expire cycle. */
@@ -706,9 +773,11 @@ void activeExpireCycle(void) {
                 (ustime()-start) > timelimit)
             {
                 timelimit_exit = 1;
-                return;
             }
-        } while (expired > REDIS_EXPIRELOOKUPS_PER_CRON/4);
+            if (timelimit_exit) return;
+            /* We don't repeat the cycle if there are less than 25% of keys
+             * found expired in the current DB. */
+        } while (expired > ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP/4);
     }
 }
 
@@ -827,7 +896,8 @@ void clientsCron(void) {
 void databasesCron(void) {
     /* Expire keys by random sampling. Not required for slaves
      * as master will synthesize DELs for us. */
-    if (server.masterhost == NULL) activeExpireCycle();
+    if (server.active_expire_enabled && server.masterhost == NULL)
+        activeExpireCycle(ACTIVE_EXPIRE_CYCLE_SLOW);
 
     /* Perform hash tables rehashing if needed, but only if there are no
      * other processes saving the DB on disk. Otherwise rehashing is bad
@@ -899,6 +969,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
      * in objects at every object access, and accuracy is not needed.
      * To access a global var is faster than calling time(NULL) */
     server.unixtime = time(NULL);
+    server.mstime = mstime();
 
     run_with_period(100) trackOperationsPerSecond();
 
@@ -1007,8 +1078,16 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
          for (j = 0; j < server.saveparamslen; j++) {
             struct saveparam *sp = server.saveparams+j;
 
+            /* Save if we reached the given amount of changes,
+             * the given amount of seconds, and if the latest bgsave was
+             * successful or if, in case of an error, at least
+             * REDIS_BGSAVE_RETRY_DELAY seconds already elapsed. */
             if (server.dirty >= sp->changes &&
-                server.unixtime-server.lastsave > sp->seconds) {
+                server.unixtime-server.lastsave > sp->seconds &&
+                (server.unixtime-server.lastbgsave_try >
+                 REDIS_BGSAVE_RETRY_DELAY ||
+                 server.lastbgsave_status == REDIS_OK))
+            {
                 redisLog(REDIS_NOTICE,"%d changes in %d seconds. Saving...",
                     sp->changes, sp->seconds);
                 /* RDB periodic dumps are redundant if we've got NDS */
@@ -1065,6 +1144,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     REDIS_NOTUSED(eventLoop);
     listNode *ln;
     redisClient *c;
+
+    /* Run a fast expire cycle. */
+    activeExpireCycle(ACTIVE_EXPIRE_CYCLE_FAST);
 
     /* Try to process pending commands for clients that were just unblocked. */
     while (listLength(server.unblocked_clients)) {
@@ -1174,6 +1256,7 @@ void initServerConfig() {
     server.verbosity = REDIS_NOTICE;
     server.maxidletime = REDIS_MAXIDLETIME;
     server.tcpkeepalive = 0;
+    server.active_expire_enabled = 1;
     server.client_max_querybuf_len = REDIS_MAX_QUERYBUF_LEN;
     server.saveparams = NULL;
     server.loading = 0;
@@ -1199,6 +1282,7 @@ void initServerConfig() {
     server.aof_flush_postponed_start = 0;
     server.nds = 0;
     server.nds_preload = 0;
+    server.aof_rewrite_incremental_fsync = 1;
     server.pidfile = zstrdup("/var/run/redis.pid");
     server.rdb_filename = zstrdup("dump.rdb");
     server.aof_filename = zstrdup("appendonly.aof");
@@ -1385,6 +1469,7 @@ void initServer() {
         server.db[j].dirty_keys = dictCreate(&dbDictType, NULL);
         server.db[j].flushing_keys = dictCreate(&dbDictType, NULL);
         server.db[j].id = j;
+        server.db[j].avg_ttl = 0;
     }
     server.pubsub_channels = dictCreate(&keylistDictType,NULL);
     server.pubsub_patterns = listCreate();
@@ -1402,7 +1487,8 @@ void initServer() {
     server.mdb_env = NULL;
     aofRewriteBufferReset();
     server.aof_buf = sdsempty();
-    server.lastsave = time(NULL);
+    server.lastsave = time(NULL); /* At startup we consider the DB saved. */
+    server.lastbgsave_try = 0;    /* At startup we never tried to BGSAVE. */
     server.rdb_save_time_last = -1;
     server.rdb_save_time_start = -1;
     server.dirty = 0;
@@ -1425,6 +1511,7 @@ void initServer() {
     server.ops_sec_last_sample_time = mstime();
     server.ops_sec_last_sample_ops = 0;
     server.unixtime = time(NULL);
+    server.mstime = mstime();
     server.lastbgsave_status = REDIS_OK;
     if(aeCreateTimeEvent(server.el, 1, serverCron, NULL, NULL) == AE_ERR) {
         redisPanic("create time event failed");
@@ -2315,8 +2402,9 @@ sds genRedisInfoString(char *section) {
                 if (server.nds) {
                     snprintf(ndskeystr, 1023, ",nds=%lu", ndskeys);
                 }
-                info = sdscatprintf(info, "db%d:keys=%lld,expires=%lld%s\r\n",
-                    j, keys, vkeys, ndskeystr);
+                info = sdscatprintf(info,
+                    "db%d:keys=%lld,expires=%lld,avg_ttl=%lld%s\r\n",
+                    j, keys, vkeys, server.db[j].avg_ttl, ndskeystr);
             }
         }
     }
@@ -2759,7 +2847,7 @@ void loadDataFromDisk(void) {
 void redisOutOfMemoryHandler(size_t allocation_size) {
     redisLog(REDIS_WARNING,"Out Of Memory allocating %zu bytes!",
         allocation_size);
-    redisPanic("OOM");
+    redisPanic("Redis aborting for OUT OF MEMORY");
 }
 
 int main(int argc, char **argv) {
