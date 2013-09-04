@@ -31,6 +31,7 @@
 #include "lzf.h"    /* LZF compression library */
 #include "zipmap.h"
 #include "endianconv.h"
+#include "nds.h"
 
 #include <math.h>
 #include <sys/types.h>
@@ -626,6 +627,21 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val,
     return 1;
 }
 
+int rdbSaveIterator(void *data, robj *key) {
+    rdbSaveIterData *idata = (rdbSaveIterData *)data;
+    long long expire = getExpire(idata->db, key);
+    robj *val = lookupKey(idata->db, key);
+    int rv = 0;
+    
+    if (rdbSaveKeyValuePair(idata->rdb, key, val, expire, idata->now) == -1) {
+    	rv = REDIS_ERR;
+    } else {
+    	rv = REDIS_OK;
+    }
+    
+    return rv;
+}
+
 /* Save the DB on disk. Return REDIS_ERR on error, REDIS_OK on success */
 int rdbSave(char *filename) {
     dictIterator *di = NULL;
@@ -653,30 +669,43 @@ int rdbSave(char *filename) {
     if (rdbWriteRaw(&rdb,magic,9) == -1) goto werr;
 
     for (j = 0; j < server.dbnum; j++) {
-        redisDb *db = server.db+j;
-        dict *d = db->dict;
-        if (dictSize(d) == 0) continue;
-        di = dictGetSafeIterator(d);
-        if (!di) {
-            fclose(fp);
-            return REDIS_ERR;
-        }
+        rdbSaveIterData idata;
+        dict *d;
+
+        idata.db = server.db+j;
+        idata.now = now;
+        idata.rdb = &rdb;
+        
+        d = idata.db->dict;
 
         /* Write the SELECT DB opcode */
         if (rdbSaveType(&rdb,REDIS_RDB_OPCODE_SELECTDB) == -1) goto werr;
         if (rdbSaveLen(&rdb,j) == -1) goto werr;
 
-        /* Iterate this DB writing every entry */
-        while((de = dictNext(di)) != NULL) {
-            sds keystr = dictGetKey(de);
-            robj key, *o = dictGetVal(de);
-            long long expire;
+        if (server.nds) {
+            if (walkNDS(idata.db, rdbSaveIterator, &idata, -1) == REDIS_ERR) {
+                goto werr;
+            }
+        } else {
+            di = dictGetSafeIterator(d);
+            if (!di) {
+                fclose(fp);
+                return REDIS_ERR;
+            }
+
+            /* Iterate this DB writing every entry */
+            while((de = dictNext(di)) != NULL) {
+                sds keystr = dictGetKey(de);
+                robj key;
             
-            initStaticStringObject(key,keystr);
-            expire = getExpire(db,&key);
-            if (rdbSaveKeyValuePair(&rdb,&key,o,expire,now) == -1) goto werr;
+                initStaticStringObject(key,keystr);
+                if (rdbSaveIterator(&idata, &key) == REDIS_ERR) {
+                    redisLog(REDIS_WARNING, "rdbSaveIterator failed");
+                    goto werr;
+                }
+            }
+            dictReleaseIterator(di);
         }
-        dictReleaseIterator(di);
     }
     di = NULL; /* So that we don't release it again on error. */
 
@@ -774,6 +803,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb) {
     size_t len;
     unsigned int i;
 
+    redisLog(REDIS_DEBUG,"LOADING OBJECT %d (at %d)\n",rdbtype,rioTell(rdb));
     if (rdbtype == REDIS_RDB_TYPE_STRING) {
         /* Read string value */
         if ((o = rdbLoadEncodedStringObject(rdb)) == NULL) return NULL;
