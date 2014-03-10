@@ -44,6 +44,9 @@
 #include <fcntl.h>
 #include <limits.h>
 
+#include <sys/types.h>
+#include <sys/stat.h>
+
 #include "hiredis.h"
 #include "sds.h"
 #include "zmalloc.h"
@@ -59,6 +62,29 @@
 #define OUTPUT_CSV 2
 #define REDIS_CLI_KEEPALIVE_INTERVAL 15 /* seconds */
 #define REDIS_DEFAULT_PIPE_TIMEOUT 30 /* seconds */
+
+#define DEBUG(...) { \
+    fprintf(stderr, "DEBUG: "); \
+    fprintf(stderr, __VA_ARGS__); \
+    fprintf(stderr, "\n"); \
+}
+#define ERROR(...) { \
+    fprintf(stderr, "ERROR: "); \
+    fprintf(stderr, __VA_ARGS__); \
+    fprintf(stderr, "\n"); \
+}
+
+#define NOTICE(...) { \
+    fprintf(stderr, "NOTICE: (%lld)", (long long)time(NULL)); \
+    fprintf(stderr, __VA_ARGS__); \
+    fprintf(stderr, "\n"); \
+}
+
+#undef DEBUG
+#define DEBUG(...) { }
+
+/*#undef ERROR*/
+/*#define ERROR(...) { }*/
 
 static redisContext *context;
 static struct config {
@@ -79,6 +105,13 @@ static struct config {
     int slave_mode;
     int pipe_mode;
     int pipe_timeout;
+
+    int replay_mode;
+    char *replay_filename;
+    char *replay_filter;
+    char *replay_orig;
+    char *replay_rewrite;
+
     int getrdb_mode;
     int stat_mode;
     char *rdb_filename;
@@ -718,6 +751,17 @@ static int parseOptions(int argc, char **argv) {
             config.pipe_mode = 1;
         } else if (!strcmp(argv[i],"--pipe-timeout") && !lastarg) {
             config.pipe_timeout = atoi(argv[++i]);
+
+        } else if (!strcmp(argv[i],"--replay") && !lastarg) {
+            config.replay_mode = 1;
+            config.replay_filename = argv[++i];
+        } else if (!strcmp(argv[i],"--filter") && !lastarg) {
+            config.replay_filter = argv[++i];
+        } else if (!strcmp(argv[i],"--orig") && !lastarg) {
+            config.replay_orig = argv[++i];
+        } else if (!strcmp(argv[i],"--rewrite") && !lastarg) {
+            config.replay_rewrite = argv[++i];
+
         } else if (!strcmp(argv[i],"--bigkeys")) {
             config.bigkeys = 1;
         } else if (!strcmp(argv[i],"--eval") && !lastarg) {
@@ -1097,7 +1141,7 @@ static void getRDB(void) {
 
     while(payload) {
         ssize_t nread, nwritten;
-        
+
         nread = read(s,buf,(payload > sizeof(buf)) ? sizeof(buf) : payload);
         if (nread <= 0) {
             fprintf(stderr,"I/O Error reading RDB payload from socket\n");
@@ -1115,6 +1159,523 @@ static void getRDB(void) {
     fsync(fd);
     fprintf(stderr,"Transfer finished with success.\n");
     exit(0);
+}
+
+int _blockWait(FILE * fp){
+    fd_set rfds;
+    struct timeval tv;
+    int ret;
+
+    DEBUG("blockWait");
+    while(1){
+        FD_ZERO(&rfds);
+        FD_SET(fileno(fp), &rfds);
+
+        tv.tv_sec = 1;          /* Wait up to 1 seconds. */
+        tv.tv_usec = 0;
+
+        ret= select(fileno(fp)+1, &rfds, NULL, NULL, &tv);
+        DEBUG("select return %d", ret);
+        /*DEBUG("feof return : %d", feof(fp));*/
+        /*clearerr(fp);*/
+        if (ret== -1){
+            perror("select() on blockWait");
+            return -1;
+        }
+        else if (ret){
+            return 0;
+        }
+        else{
+            continue;
+        }
+    }
+}
+
+/*wait for file append*/
+int blockWait(FILE * fp){
+    off_t size = 0;
+    struct stat stats;
+    if (fstat (fileno(fp), &stats) != 0)
+    {
+        ERROR("error on fstat");
+        return -1;
+    }
+    size = stats.st_size;
+
+    DEBUG("blockWait");
+    while(1){
+        if (fstat (fileno(fp), &stats) != 0) {
+            ERROR("error on fstat");
+            return -1;
+        }
+        if (size != stats.st_size){
+            break;
+        }
+        sleep(1);
+    }
+    return 0;
+}
+
+//like fgets,but block,
+//return 0 on success
+//return -1 if can not find '\n' after 'size' bytes
+int blockReadline(FILE * fp, char * buf, int size){
+    int i = 0;
+    int c = 0;
+
+    while(1){
+        c = fgetc(fp);
+        if(c == EOF) {
+            NOTICE("check tail")
+            if (blockWait(fp) == -1){
+                return -1;
+            }
+            continue;
+        }
+
+        buf[i++] = c;
+        if(c == '\n'){
+            buf[i] = 0;
+            break;
+        }
+        if(i >= size){
+            return -1;
+        }
+    }
+    return 0;
+}
+
+//like fread, but block until readed 'size' bytes.
+//return 0 on success
+//return -1 on error
+int blockReadBytes(FILE * fp, char * buf, int size){
+    int ret = 0;
+    int readed = 0;
+    while(1){
+        ret = fread(buf+readed, 1, size-readed, fp);
+        if(ret == EOF) {
+            if (blockWait(fp) == -1){
+                return -1;
+            }
+            continue;
+        }
+
+        readed += ret;
+        if (readed == size){
+            return readed;
+        }
+    }
+}
+
+int readLong(FILE *fp, char prefix) {
+    char buf[128];
+    if (blockReadline(fp, buf, sizeof(buf)) == -1) {
+        ERROR("blockReadline return: -1");
+        return -1;
+    }
+    if (buf[0] != prefix) {
+        ERROR("prefix error on readLong, [expect: %c], [got: %c]", prefix, buf[0]);
+        return -1;
+    }
+    /*DEBUG("blockReadline return: %s", buf);*/
+    return strtol(buf+1, NULL, 10);
+}
+
+typedef struct Msg{
+    int argc;
+    char ** argv;
+}Msg;
+
+//read one msg
+//return 0 on success
+//return -1 on error
+static int readMsg(FILE * fp, Msg* msg){
+    int i = 0;
+    int len = 0;
+    int ret = 0;
+    char buf[128];
+
+    msg->argc = readLong(fp, '*');
+    if (msg->argc < 1) {
+        ERROR("readLong return: %d", msg->argc);
+        return -1;
+    }
+    DEBUG("got argc: %d", msg->argc);
+
+    msg->argv = zmalloc(sizeof(char*)*msg->argc);
+    for (i = 0; i < msg->argc; i++) {
+        len = readLong(fp, '$');
+        if (len < 1) {
+            ERROR("readLong return: %d", len);
+            return -1;
+        }
+        msg->argv[i] = sdsnewlen(NULL, len);
+        ret = blockReadBytes(fp, msg->argv[i], len);
+        if (ret == -1) {
+            ERROR("blockReadBytes return: %d", ret);
+            return -1;
+        }
+
+        ret = blockReadBytes(fp, buf, 2); //CRCL
+        if (ret == -1) {
+            ERROR("blockReadBytes return: %d", ret);
+            return -1;
+        }
+
+        DEBUG("got arg: %s", msg->argv[i]);
+    }
+    return 0;
+}
+
+#define CMD_SUPPORTED_NUM 78
+
+static char * cmd_supported[] = { //78 cmd gen by:  cat notes/redis.md  | grep 'Yes ' | awk '{print $2}' | vim -
+    "SET",
+    "HMSET",
+    "EXPIRE",
+    "EXPIREAT",
+    "PERSIST",
+    "PEXPIRE",
+    "PEXPIREAT",
+    "DEL",
+    "DUMP",
+    "EXISTS",
+    "PTTL",
+    "RESTORE",
+    "TTL",
+    "TYPE",
+    "APPEND",
+    "BITCOUNT",
+    "DECR",
+    "DECRBY",
+    "GET",
+    "GETBIT",
+    "GETRANGE",
+    "GETSET",
+    "INCR",
+    "INCRBY",
+    "INCRBYFLOAT",
+    "MGET",
+    "PSETEX",
+    "SETBIT",
+    "SETEX",
+    "SETNX",
+    "SETRANGE",
+    "STRLEN",
+    "HDEL",
+    "HEXISTS",
+    "HGET",
+    "HGETALL",
+    "HINCRBY",
+    "HINCRBYFLOAT",
+    "HKEYS",
+    "HLEN",
+    "HMGET",
+    "HSET",
+    "HSETNX",
+    "HVALS",
+    "LINDEX",
+    "LINSERT",
+    "LLEN",
+    "LPOP",
+    "LPUSH",
+    "LPUSHX",
+    "LRANGE",
+    "LREM",
+    "LSET",
+    "LTRIM",
+    "RPOP",
+    "RPUSH",
+    "RPUSHX",
+    "SADD",
+    "SCARD",
+    "SISMEMBER",
+    "SMEMBERS",
+    "SPOP",
+    "SRANDMEMBER",
+    "SREM",
+    "ZADD",
+    "ZCARD",
+    "ZCOUNT",
+    "ZINCRBY",
+    "ZRANGE",
+    "ZRANGEBYSCORE",
+    "ZRANK",
+    "ZREM",
+    "ZREMRANGEBYRANK",
+    "ZREMRANGEBYSCORE",
+    "ZREVRANGE",
+    "ZREVRANGEBYSCORE",
+    "ZREVRANK",
+    "ZSCORE",
+};
+
+static int cmdSupport(char * cmd){
+    int i = 0;
+    for(i=0; i<CMD_SUPPORTED_NUM; i++){
+        if(0 == strcmp(cmd_supported[i], cmd)){
+            return 1;
+        }
+    }
+    return 0;
+}
+
+//TODO: if is delete, rewrite all keys.
+//1. filter by cmd
+//2. filter by key
+//3. rewrite keys
+static int filterMsg(Msg *msg){
+    char * cmd = msg->argv[0];
+    sdstoupper(cmd);
+    if(!cmdSupport(cmd)){
+        msg->argc = 0;
+    }
+    return 0;
+}
+
+static int sizeofMsg(Msg * msg){
+    if(0 == msg->argc){
+        return 0;
+    }
+    int ret = 0, i = 0;
+    int len = 0;
+    ret = snprintf(NULL, 0, "*%d\r\n", msg->argc);
+    len += ret;
+    for (i = 0; i<msg->argc; i++){
+        ret = snprintf(NULL, 0, "$%ld\r\n", sdslen(msg->argv[i]));
+        len += ret;
+
+        len += sdslen(msg->argv[i]);
+
+        len += 2;
+    }
+    return len;
+}
+
+//return len
+static int formatMsg(char *buf, Msg *msg){
+    char * orig = buf;
+    int ret = 0, i = 0;
+
+    if(0 == msg->argc){
+        return 0;
+    }
+
+    ret = sprintf(buf, "*%d\r\n", msg->argc);
+    buf += ret;
+
+    for (i = 0; i<msg->argc; i++){
+        ret = sprintf(buf, "$%ld\r\n", sdslen(msg->argv[i]));
+        buf += ret;
+
+        memcpy(buf, msg->argv[i], sdslen(msg->argv[i]));
+        buf += sdslen(msg->argv[i]);
+
+        ret = sprintf(buf, "\r\n");
+        buf += ret;
+    }
+    return buf - orig;
+}
+
+void freeMsg(Msg * msg){
+    int i = 0;
+    for(i=0; i < msg->argc; i++){
+        sdsfree(msg->argv[i]);
+        msg->argv[i] = NULL;
+    }
+    zfree(msg->argv);
+}
+
+/*TODO: if batchsize is not 1, and at the end of file, it will wait (may lost msgs)*/
+#define BATCHSIZE 1
+static int myread(FILE * fp, char ** buf, int * buf_size){
+    Msg msgs[BATCHSIZE];
+    int i;
+    int totSize = 0;
+    int ret = 0;
+    int len = 0;
+
+    memset(msgs, sizeof(Msg), BATCHSIZE);
+    for(i = 0; i< BATCHSIZE; i++){
+        ret = readMsg(fp, msgs+i);
+        if(ret < 0){
+            ERROR("error on readMsg");
+            return -1;
+        }
+        ret = filterMsg(msgs+i);
+        if(ret < 0){
+            ERROR("error on filterMsg");
+            return -1;
+        }
+        totSize += sizeofMsg(msgs+i);
+    }
+    if (totSize > *buf_size){
+        *buf_size = totSize + 1024;
+        *buf = zrealloc(*buf, *buf_size);
+    }
+
+    for(i = 0; i< BATCHSIZE; i++){
+        ret = formatMsg(*buf + len, msgs+i);
+        len += ret;
+        freeMsg(msgs+i);
+    }
+    DEBUG("myread return %d", len);
+    return len;
+}
+
+
+static void replayMode(void) {
+    int fd = context->fd;
+    long long errors = 0, replies = 0, obuf_len = 0, obuf_pos = 0;
+    char ibuf[1024*16];/* Input and output buffers */
+    int obuf_size = 1024*1024;
+    char* obuf = zmalloc(obuf_size);
+
+    char aneterr[ANET_ERR_LEN];
+    redisReader *reader = redisReaderCreate();
+    redisReply *reply;
+    int eof = 0; /* True once we consumed all the standard input. */
+    int done = 0;
+    char magic[20]; /* Special reply we recognize. */
+    time_t last_read_time = time(NULL);
+
+    FILE *fp = NULL;
+    fp = fopen(config.replay_filename, "r");
+    if (!fp) {
+        fprintf(stderr,
+            "Can't open file '%s': %s\n", config.eval, strerror(errno));
+        exit(1);
+    }
+    NOTICE("start")
+
+    srand(time(NULL));
+
+    /* Use non blocking I/O. */
+    if (anetNonBlock(aneterr,fd) == ANET_ERR) {
+        fprintf(stderr, "Can't set the socket in non blocking mode: %s\n",
+            aneterr);
+        exit(1);
+    }
+
+    /* Transfer raw protocol and read replies from the server at the same
+     * time. */
+    while(!done) {
+        int mask = AE_READABLE;
+
+        if (!eof || obuf_len != 0) mask |= AE_WRITABLE;
+        mask = aeWait(fd,mask,1000);
+
+        NOTICE("mask: %d", mask);
+        /* Handle the readable state: we can read replies from the server. */
+        if (mask & AE_READABLE) {
+            ssize_t nread;
+
+            /* Read from socket and feed the hiredis reader. */
+            do {
+                nread = read(fd,ibuf,sizeof(ibuf));
+                if (nread == -1 && errno != EAGAIN && errno != EINTR) {
+                    fprintf(stderr, "Error reading from the server: %s\n",
+                        strerror(errno));
+                    exit(1);
+                }
+                if (nread > 0) {
+                    redisReaderFeed(reader,ibuf,nread);
+                    last_read_time = time(NULL);
+                }
+            } while(nread > 0);
+
+            /* Consume replies. */
+            do {
+                if (redisReaderGetReply(reader,(void**)&reply) == REDIS_ERR) {
+                    fprintf(stderr, "Error reading replies from server\n");
+                    exit(1);
+                }
+                if (reply) {
+                    if (reply->type == REDIS_REPLY_ERROR) {
+                        fprintf(stderr,"%s\n", reply->str);
+                        errors++;
+                    } else if (eof && reply->type == REDIS_REPLY_STRING &&
+                                      reply->len == 20) {
+                        /* Check if this is the reply to our final ECHO
+                         * command. If so everything was received
+                         * from the server. */
+                        if (memcmp(reply->str,magic,20) == 0) {
+                            printf("Last reply received from server.\n");
+                            done = 1;
+                            replies--;
+                        }
+                    }
+                    replies++;
+                    if (replies % 1000 == 0){
+                        NOTICE("%d done!", replies);
+                    }
+                    freeReplyObject(reply);
+                }
+            } while(reply);
+        }
+
+        /* Handle the writable state: we can send protocol to the server. */
+        if (mask & AE_WRITABLE) {
+            while(1) {
+                /* Transfer current buffer to server. */
+                if (obuf_len != 0) {
+                    ssize_t nwritten = write(fd,obuf+obuf_pos,obuf_len);
+
+                    if (nwritten == -1) {
+                        if (errno != EAGAIN && errno != EINTR) {
+                            fprintf(stderr, "Error writing to the server: %s\n",
+                                strerror(errno));
+                            exit(1);
+                        } else {
+                            nwritten = 0;
+                        }
+                    }
+                    obuf_len -= nwritten;
+                    obuf_pos += nwritten;
+                    if (obuf_len != 0) {
+                        NOTICE("obuf_len != 0 , break");
+                        break; /* Can't accept more data. */
+                    }
+                }
+                /* If buffer is empty, load from stdin. */
+                if (obuf_len == 0 && !eof) {
+                    ssize_t nread = myread(fp, &obuf, &obuf_size);
+                    DEBUG("myread return %d: %s", nread, obuf);
+                    if (nread == 0) {
+                        DEBUG("myread got 0 bytes");
+                    } else if (nread == -1) {
+                        fprintf(stderr, "Error reading from stdin: %s\n",
+                            strerror(errno));
+                        exit(1);
+                    } else {
+                        obuf_len = nread;
+                        obuf_pos = 0;
+                    }
+                }
+                if (obuf_len == 0 && eof) break;
+            }
+        }
+
+        /* Handle timeout, that is, we reached EOF, and we are not getting
+         * replies from the server for a few seconds, nor the final ECHO is
+         * received. */
+        if (eof && config.pipe_timeout > 0 &&
+            time(NULL)-last_read_time > config.pipe_timeout)
+        {
+            fprintf(stderr,"No replies for %d seconds: exiting.\n",
+                config.pipe_timeout);
+            errors++;
+            break;
+        }
+    }
+    redisReaderFree(reader);
+    printf("errors: %lld, replies: %lld\n", errors, replies);
+    if (errors)
+        exit(1);
+    else
+        exit(0);
+
+
 }
 
 static void pipeMode(void) {
@@ -1176,7 +1737,7 @@ static void pipeMode(void) {
                         errors++;
                     } else if (eof && reply->type == REDIS_REPLY_STRING &&
                                       reply->len == 20) {
-                        /* Check if this is the reply to our final ECHO 
+                        /* Check if this is the reply to our final ECHO
                          * command. If so everything was received
                          * from the server. */
                         if (memcmp(reply->str,magic,20) == 0) {
@@ -1197,7 +1758,7 @@ static void pipeMode(void) {
                 /* Transfer current buffer to server. */
                 if (obuf_len != 0) {
                     ssize_t nwritten = write(fd,obuf+obuf_pos,obuf_len);
-                    
+
                     if (nwritten == -1) {
                         if (errno != EAGAIN && errno != EINTR) {
                             fprintf(stderr, "Error writing to the server: %s\n",
@@ -1514,6 +2075,13 @@ int main(int argc, char **argv) {
     config.rdb_filename = NULL;
     config.pipe_mode = 0;
     config.pipe_timeout = REDIS_DEFAULT_PIPE_TIMEOUT;
+
+    config.replay_mode = 0;
+    config.replay_filename = NULL;
+    config.replay_filter = NULL;
+    config.replay_orig = NULL;
+    config.replay_rewrite = NULL;
+
     config.bigkeys = 0;
     config.stdinarg = 0;
     config.auth = NULL;
@@ -1551,6 +2119,12 @@ int main(int argc, char **argv) {
     if (config.pipe_mode) {
         if (cliConnect(0) == REDIS_ERR) exit(1);
         pipeMode();
+    }
+
+    /* Replay mode */
+    if (config.replay_mode) {
+        if (cliConnect(0) == REDIS_ERR) exit(1);
+        replayMode();
     }
 
     /* Find big keys */

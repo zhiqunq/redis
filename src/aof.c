@@ -483,8 +483,10 @@ int loadAppendOnlyFile(char *filename) {
     if (fp && redis_fstat(fileno(fp),&sb) != -1 && sb.st_size == 0) {
         server.aof_current_size = 0;
         fclose(fp);
+        redisLog(REDIS_WARNING, "ning: 1  %s",strerror(errno));
         return REDIS_ERR;
     }
+    redisLog(REDIS_WARNING, "ning: 2  %s",strerror(errno));
 
     if (fp == NULL) {
         redisLog(REDIS_WARNING,"Fatal error: can't open the append log file for reading: %s",strerror(errno));
