@@ -272,6 +272,7 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
         }
         c->written += nwritten;
         if (sdslen(c->obuf) == c->written) {
+            fprintf(stderr, "xxx\n");
             aeDeleteFileEvent(config.el,c->context->fd,AE_WRITABLE);
             aeCreateFileEvent(config.el,c->context->fd,AE_READABLE,readHandler,c);
         }

@@ -46,6 +46,7 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <signal.h>
 
 #include "hiredis.h"
 #include "sds.h"
@@ -1284,7 +1285,28 @@ int readLong(FILE *fp, char prefix) {
 typedef struct Msg{
     int argc;
     char ** argv;
+    size_t *argvlen;
 }Msg;
+
+static Msg* newMsg(int argc){
+    Msg * msg;
+    msg = zmalloc(sizeof(Msg));
+    msg->argc = argc;
+    msg->argv = zmalloc(sizeof(char*) * msg->argc);
+    msg->argvlen = zmalloc(msg->argc);
+    return msg;
+}
+
+void freeMsg(Msg * msg){
+    int i = 0;
+    for(i=0; i < msg->argc; i++){
+        sdsfree(msg->argv[i]);
+        msg->argv[i] = NULL;
+    }
+    zfree(msg->argv);
+    zfree(msg->argvlen);
+    zfree(msg);
+}
 
 //read one msg
 //return 0 on success
@@ -1302,9 +1324,12 @@ static int readMsg(FILE * fp, Msg* msg){
     }
     DEBUG("got argc: %d", msg->argc);
 
-    msg->argv = zmalloc(sizeof(char*)*msg->argc);
+    msg->argv = zmalloc(sizeof(char*) * msg->argc);
+    msg->argvlen = zmalloc(msg->argc);
     for (i = 0; i < msg->argc; i++) {
         len = readLong(fp, '$');
+        msg->argvlen[i] = len;
+
         if (len < 1) {
             ERROR("readLong return: %d", len);
             return -1;
@@ -1330,6 +1355,7 @@ static int readMsg(FILE * fp, Msg* msg){
 #define CMD_SUPPORTED_NUM 78
 
 static char * cmd_supported[] = { //78 cmd gen by:  cat notes/redis.md  | grep 'Yes ' | awk '{print $2}' | vim -
+    "MSET", //change to many
     "SET",
     "HMSET",
     "EXPIRE",
@@ -1337,7 +1363,7 @@ static char * cmd_supported[] = { //78 cmd gen by:  cat notes/redis.md  | grep '
     "PERSIST",
     "PEXPIRE",
     "PEXPIREAT",
-    "DEL",
+    "DEL",  //change to many
     "DUMP",
     "EXISTS",
     "PTTL",
@@ -1477,14 +1503,6 @@ static int formatMsg(char *buf, Msg *msg){
     return buf - orig;
 }
 
-void freeMsg(Msg * msg){
-    int i = 0;
-    for(i=0; i < msg->argc; i++){
-        sdsfree(msg->argv[i]);
-        msg->argv[i] = NULL;
-    }
-    zfree(msg->argv);
-}
 
 /*TODO: if batchsize is not 1, and at the end of file, it will wait (may lost msgs)*/
 #define BATCHSIZE 1
@@ -1521,6 +1539,62 @@ static int myread(FILE * fp, char ** buf, int * buf_size){
     }
     DEBUG("myread return %d", len);
     return len;
+}
+
+static void sighandler( int sig_no ) { exit(0); }
+/**
+ *
+ * safe replay (one by one)
+ * 7k - 8k on twemproxy
+ * 11k on redis
+ */
+static int safeReplayMode(void) {
+    int cnt = 0;
+    int ret;
+    Msg msg;
+    FILE *fp = NULL;
+    redisReply *reply;
+
+    signal(SIGUSR1, sighandler );// for gprof
+
+    fp = fopen(config.replay_filename, "r");
+    if (!fp) {
+        fprintf(stderr,
+            "Can't open file '%s': %s\n", config.eval, strerror(errno));
+        exit(1);
+    }
+
+    NOTICE("start");
+    cnt = 0;
+    while(1){
+        ret = readMsg(fp, &msg);
+        if(ret < 0){
+            ERROR("error on readMsg");
+            return -1;
+        }
+
+        ret = filterMsg(&msg);
+        if(ret < 0){
+            ERROR("error on filterMsg");
+            return -1;
+        }
+
+        if (msg.argc == 0){
+            continue;
+        }
+
+        cnt ++;
+        if (cnt%10000 == 0){
+            NOTICE("%d done!", cnt);
+        }
+
+        /*reply = redisCommandArgv(context, msg.argc, msg.argv, msg.argvlen);*/
+        /*if (!reply){*/
+            /*ERROR("Error on cmd %d %s %s", msg.argc, msg.argv[0], msg.argv[1]);*/
+            /*return -1;*/
+        /*}*/
+        /*freeReplyObject(reply);*/
+    }
 }
 
 
@@ -2124,7 +2198,8 @@ int main(int argc, char **argv) {
     /* Replay mode */
     if (config.replay_mode) {
         if (cliConnect(0) == REDIS_ERR) exit(1);
-        replayMode();
+        /*replayMode();*/
+        safeReplayMode();
     }
 
     /* Find big keys */

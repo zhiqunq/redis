@@ -222,6 +222,9 @@ bench: $(REDIS_BENCHMARK_NAME)
 gcov:
 	$(MAKE) REDIS_CFLAGS="-fprofile-arcs -ftest-coverage -DCOVERAGE_TEST" REDIS_LDFLAGS="-fprofile-arcs -ftest-coverage"
 
+gprof:
+	$(MAKE) REDIS_CFLAGS="-pg" REDIS_LDFLAGS="-pg"
+
 noopt:
 	$(MAKE) OPTIMIZATION="-O0"
 
