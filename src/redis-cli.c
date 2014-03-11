@@ -84,8 +84,6 @@
 #undef DEBUG
 #define DEBUG(...) { }
 
-/*#undef ERROR*/
-/*#define ERROR(...) { }*/
 
 static redisContext *context;
 static struct config {
@@ -1311,45 +1309,45 @@ void freeMsg(Msg * msg){
 //read one msg
 //return 0 on success
 //return -1 on error
-static int readMsg(FILE * fp, Msg* msg){
+static Msg* readMsg(FILE * fp){
     int i = 0;
     int len = 0;
     int ret = 0;
     char buf[128];
+    Msg * msg;
 
-    msg->argc = readLong(fp, '*');
-    if (msg->argc < 1) {
-        ERROR("readLong return: %d", msg->argc);
-        return -1;
+    len = readLong(fp, '*');
+    if (len < 1) {
+        ERROR("readLong return: %d", len);
+        return NULL;
     }
-    DEBUG("got argc: %d", msg->argc);
+    DEBUG("got argc: %d", len);
+    msg = newMsg(len);
 
-    msg->argv = zmalloc(sizeof(char*) * msg->argc);
-    msg->argvlen = zmalloc(msg->argc);
     for (i = 0; i < msg->argc; i++) {
         len = readLong(fp, '$');
         msg->argvlen[i] = len;
 
         if (len < 1) {
             ERROR("readLong return: %d", len);
-            return -1;
+            return NULL;
         }
         msg->argv[i] = sdsnewlen(NULL, len);
         ret = blockReadBytes(fp, msg->argv[i], len);
         if (ret == -1) {
             ERROR("blockReadBytes return: %d", ret);
-            return -1;
+            return NULL;
         }
 
         ret = blockReadBytes(fp, buf, 2); //CRCL
         if (ret == -1) {
             ERROR("blockReadBytes return: %d", ret);
-            return -1;
+            return NULL;
         }
 
         DEBUG("got arg: %s", msg->argv[i]);
     }
-    return 0;
+    return msg;
 }
 
 #define CMD_SUPPORTED_NUM 78
@@ -1507,25 +1505,24 @@ static int formatMsg(char *buf, Msg *msg){
 /*TODO: if batchsize is not 1, and at the end of file, it will wait (may lost msgs)*/
 #define BATCHSIZE 1
 static int myread(FILE * fp, char ** buf, int * buf_size){
-    Msg msgs[BATCHSIZE];
+    Msg* msgs[BATCHSIZE];
     int i;
     int totSize = 0;
     int ret = 0;
     int len = 0;
 
-    memset(msgs, sizeof(Msg), BATCHSIZE);
     for(i = 0; i< BATCHSIZE; i++){
-        ret = readMsg(fp, msgs+i);
-        if(ret < 0){
+        msgs[i] = readMsg(fp);
+        if(!msgs[i]){
             ERROR("error on readMsg");
             return -1;
         }
-        ret = filterMsg(msgs+i);
+        ret = filterMsg(msgs[i]);
         if(ret < 0){
             ERROR("error on filterMsg");
             return -1;
         }
-        totSize += sizeofMsg(msgs+i);
+        totSize += sizeofMsg(msgs[i]);
     }
     if (totSize > *buf_size){
         *buf_size = totSize + 1024;
@@ -1533,9 +1530,9 @@ static int myread(FILE * fp, char ** buf, int * buf_size){
     }
 
     for(i = 0; i< BATCHSIZE; i++){
-        ret = formatMsg(*buf + len, msgs+i);
+        ret = formatMsg(*buf + len, msgs[i]);
         len += ret;
-        freeMsg(msgs+i);
+        freeMsg(msgs[i]);
     }
     DEBUG("myread return %d", len);
     return len;
@@ -1548,12 +1545,12 @@ static void sighandler( int sig_no ) { exit(0); }
  * 7k - 8k on twemproxy
  * 11k on redis
  */
-static int safeReplayMode(void) {
+static int safeReplayMode(void){
     int cnt = 0;
     int ret;
-    Msg msg;
-    FILE *fp = NULL;
+    Msg* msg;
     redisReply *reply;
+    FILE *fp = NULL;
 
     signal(SIGUSR1, sighandler );// for gprof
 
@@ -1567,51 +1564,47 @@ static int safeReplayMode(void) {
     NOTICE("start");
     cnt = 0;
     while(1){
-        ret = readMsg(fp, &msg);
-        if(ret < 0){
+        msg = readMsg(fp);
+        if(!msg){
             ERROR("error on readMsg");
             return -1;
         }
 
-        ret = filterMsg(&msg);
+        ret = filterMsg(msg);
         if(ret < 0){
             ERROR("error on filterMsg");
             return -1;
         }
 
-        if (msg.argc == 0){
+        if (msg->argc == 0){
             continue;
         }
 
         cnt ++;
-        if (cnt%10000 == 0){
+        if (cnt%100000 == 0){
             NOTICE("%d done!", cnt);
         }
-
-        /*reply = redisCommandArgv(context, msg.argc, msg.argv, msg.argvlen);*/
-        /*if (!reply){*/
-            /*ERROR("Error on cmd %d %s %s", msg.argc, msg.argv[0], msg.argv[1]);*/
-            /*return -1;*/
-        /*}*/
-        /*freeReplyObject(reply);*/
+        reply = redisCommandArgv(context, msg->argc, (const char **)msg->argv, msg->argvlen);
+        if (!reply){
+            ERROR("Error on cmd %d %s %s", msg->argc, msg->argv[0], msg->argv[1]);
+            return -1;
+        }
+        freeReplyObject(reply);
+        freeMsg(msg);
     }
 }
 
-
 static void replayMode(void) {
     int fd = context->fd;
-    long long errors = 0, replies = 0, obuf_len = 0, obuf_pos = 0;
-    char ibuf[1024*16];/* Input and output buffers */
+
+    long long requests = 0, replies = 0, obuf_len = 0, obuf_pos = 0;
+    char ibuf[1024*16];         /* Input buffer */
     int obuf_size = 1024*1024;
     char* obuf = zmalloc(obuf_size);
 
     char aneterr[ANET_ERR_LEN];
     redisReader *reader = redisReaderCreate();
     redisReply *reply;
-    int eof = 0; /* True once we consumed all the standard input. */
-    int done = 0;
-    char magic[20]; /* Special reply we recognize. */
-    time_t last_read_time = time(NULL);
 
     FILE *fp = NULL;
     fp = fopen(config.replay_filename, "r");
@@ -1622,134 +1615,89 @@ static void replayMode(void) {
     }
     NOTICE("start")
 
-    srand(time(NULL));
-
-    /* Use non blocking I/O. */
+    /* setup non blocking I/O. */
     if (anetNonBlock(aneterr,fd) == ANET_ERR) {
         fprintf(stderr, "Can't set the socket in non blocking mode: %s\n",
             aneterr);
         exit(1);
     }
 
-    /* Transfer raw protocol and read replies from the server at the same
-     * time. */
-    while(!done) {
+    while(1) {
         int mask = AE_READABLE;
-
-        if (!eof || obuf_len != 0) mask |= AE_WRITABLE;
+        DEBUG("request: %lld, replies: %lld", requests, replies);
+        if ((replies == requests) || (obuf_len != 0))
+            mask |= AE_WRITABLE;
         mask = aeWait(fd,mask,1000);
 
-        NOTICE("mask: %d", mask);
-        /* Handle the readable state: we can read replies from the server. */
+        DEBUG("mask: %d", mask);
         if (mask & AE_READABLE) {
             ssize_t nread;
 
-            /* Read from socket and feed the hiredis reader. */
             do {
                 nread = read(fd,ibuf,sizeof(ibuf));
                 if (nread == -1 && errno != EAGAIN && errno != EINTR) {
-                    fprintf(stderr, "Error reading from the server: %s\n",
-                        strerror(errno));
+                    ERROR("Error reading from the server: %s", strerror(errno));
                     exit(1);
                 }
                 if (nread > 0) {
                     redisReaderFeed(reader,ibuf,nread);
-                    last_read_time = time(NULL);
                 }
             } while(nread > 0);
 
             /* Consume replies. */
             do {
                 if (redisReaderGetReply(reader,(void**)&reply) == REDIS_ERR) {
-                    fprintf(stderr, "Error reading replies from server\n");
+                    ERROR("Error reading replies from server");
                     exit(1);
                 }
                 if (reply) {
                     if (reply->type == REDIS_REPLY_ERROR) {
-                        fprintf(stderr,"%s\n", reply->str);
-                        errors++;
-                    } else if (eof && reply->type == REDIS_REPLY_STRING &&
-                                      reply->len == 20) {
-                        /* Check if this is the reply to our final ECHO
-                         * command. If so everything was received
-                         * from the server. */
-                        if (memcmp(reply->str,magic,20) == 0) {
-                            printf("Last reply received from server.\n");
-                            done = 1;
-                            replies--;
-                        }
+                        ERROR("got error: %s", reply->str);
+                        exit(1);
                     }
                     replies++;
-                    if (replies % 1000 == 0){
-                        NOTICE("%d done!", replies);
+                    if (replies % 10000 == 0){
+                        NOTICE("%lld done!", replies);
                     }
                     freeReplyObject(reply);
                 }
             } while(reply);
         }
 
-        /* Handle the writable state: we can send protocol to the server. */
         if (mask & AE_WRITABLE) {
-            while(1) {
-                /* Transfer current buffer to server. */
-                if (obuf_len != 0) {
-                    ssize_t nwritten = write(fd,obuf+obuf_pos,obuf_len);
+            if (obuf_len != 0) {
+                ssize_t nwritten = write(fd,obuf+obuf_pos,obuf_len);
 
-                    if (nwritten == -1) {
-                        if (errno != EAGAIN && errno != EINTR) {
-                            fprintf(stderr, "Error writing to the server: %s\n",
-                                strerror(errno));
-                            exit(1);
-                        } else {
-                            nwritten = 0;
-                        }
-                    }
-                    obuf_len -= nwritten;
-                    obuf_pos += nwritten;
-                    if (obuf_len != 0) {
-                        NOTICE("obuf_len != 0 , break");
-                        break; /* Can't accept more data. */
-                    }
-                }
-                /* If buffer is empty, load from stdin. */
-                if (obuf_len == 0 && !eof) {
-                    ssize_t nread = myread(fp, &obuf, &obuf_size);
-                    DEBUG("myread return %d: %s", nread, obuf);
-                    if (nread == 0) {
-                        DEBUG("myread got 0 bytes");
-                    } else if (nread == -1) {
-                        fprintf(stderr, "Error reading from stdin: %s\n",
-                            strerror(errno));
+                if (nwritten == -1) {
+                    if (errno != EAGAIN && errno != EINTR) {
+                        ERROR("Error writing to the server: %s", strerror(errno));
                         exit(1);
                     } else {
-                        obuf_len = nread;
-                        obuf_pos = 0;
+                        nwritten = 0;
                     }
                 }
-                if (obuf_len == 0 && eof) break;
+                obuf_len -= nwritten;
+                obuf_pos += nwritten;
             }
-        }
-
-        /* Handle timeout, that is, we reached EOF, and we are not getting
-         * replies from the server for a few seconds, nor the final ECHO is
-         * received. */
-        if (eof && config.pipe_timeout > 0 &&
-            time(NULL)-last_read_time > config.pipe_timeout)
-        {
-            fprintf(stderr,"No replies for %d seconds: exiting.\n",
-                config.pipe_timeout);
-            errors++;
-            break;
+            /* If buffer is empty, load from file. */
+            if (obuf_len == 0) {
+                ssize_t nread = myread(fp, &obuf, &obuf_size);
+                DEBUG("myread return %d: %s", nread, obuf);
+                if (nread == 0) {
+                    DEBUG("myread got 0 bytes");
+                } else if (nread == -1) {
+                    ERROR("Error on reading from input: %s", strerror(errno));
+                    exit(1);
+                } else {
+                    obuf_len = nread;
+                    obuf_pos = 0;
+                    requests ++;//TODO +=?
+                }
+            }
         }
     }
     redisReaderFree(reader);
-    printf("errors: %lld, replies: %lld\n", errors, replies);
-    if (errors)
-        exit(1);
-    else
-        exit(0);
-
-
+    exit(0);
 }
 
 static void pipeMode(void) {
@@ -2198,8 +2146,8 @@ int main(int argc, char **argv) {
     /* Replay mode */
     if (config.replay_mode) {
         if (cliConnect(0) == REDIS_ERR) exit(1);
-        /*replayMode();*/
-        safeReplayMode();
+        replayMode();
+        /*safeReplayMode();*/
     }
 
     /* Find big keys */
