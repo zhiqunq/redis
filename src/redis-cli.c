@@ -1347,13 +1347,24 @@ static Msg* readMsg(FILE * fp){
 
         DEBUG("got arg: %s", msg->argv[i]);
     }
+    char * cmd = msg->argv[0];
+    sdstoupper(cmd);
     return msg;
 }
 
 #define CMD_SUPPORTED_NUM 78
 
-static char * cmd_supported[] = { //78 cmd gen by:  cat notes/redis.md  | grep 'Yes ' | awk '{print $2}' | vim -
-    "MSET", //change to many
+/**
+78 cmd gen by:  cat notes/redis.md  | grep 'Yes ' | awk '{print $2}' | vim -
+exceptions:
+- MSET
+- MSETNX
+
+*/
+static char * CMD_SUPPORTED[] = {
+    "MSET", //change to many, then filter and rewrite
+    "MSETNX", //change to many, then filter and rewrite
+    "DEL",  //change to many, then filter and rewrite
     "SET",
     "HMSET",
     "EXPIRE",
@@ -1361,7 +1372,6 @@ static char * cmd_supported[] = { //78 cmd gen by:  cat notes/redis.md  | grep '
     "PERSIST",
     "PEXPIRE",
     "PEXPIREAT",
-    "DEL",  //change to many
     "DUMP",
     "EXISTS",
     "PTTL",
@@ -1437,24 +1447,33 @@ static char * cmd_supported[] = { //78 cmd gen by:  cat notes/redis.md  | grep '
 static int cmdSupport(char * cmd){
     int i = 0;
     for(i=0; i<CMD_SUPPORTED_NUM; i++){
-        if(0 == strcmp(cmd_supported[i], cmd)){
+        if(0 == strcmp(CMD_SUPPORTED[i], cmd)){
             return 1;
         }
     }
     return 0;
 }
 
+/**
+ * filter to check if it's supported
+ * if the cmd is multikey MSET/MSETNX/DEL, split it.
+ */
 //TODO: if is delete, rewrite all keys.
-//1. filter by cmd
-//2. filter by key
-//3. rewrite keys
 static int filterMsg(Msg *msg){
     char * cmd = msg->argv[0];
-    sdstoupper(cmd);
     if(!cmdSupport(cmd)){
         msg->argc = 0;
     }
     return 0;
+}
+
+/*
+1. filter by cmd
+2. filter by key
+3. rewrite keys
+*/
+static int rewriteKey(Msg *msg){
+
 }
 
 static int sizeofMsg(Msg * msg){
@@ -1503,7 +1522,10 @@ static int formatMsg(char *buf, Msg *msg){
 
 
 /*TODO: if batchsize is not 1, and at the end of file, it will wait (may lost msgs)*/
+//TODO: return request number.
+// batch=1: 6w, batch=10: 8w.
 #define BATCHSIZE 1
+
 static int myread(FILE * fp, char ** buf, int * buf_size){
     Msg* msgs[BATCHSIZE];
     int i;
@@ -1571,10 +1593,6 @@ static int safeReplayMode(void){
         }
 
         ret = filterMsg(msg);
-        if(ret < 0){
-            ERROR("error on filterMsg");
-            return -1;
-        }
 
         if (msg->argc == 0){
             continue;
