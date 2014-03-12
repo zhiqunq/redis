@@ -1610,13 +1610,15 @@ static int rewriteMsg(Msg *msg, Msg ***o_msgs, int *o_num){
 
 /*
  * return bytes readed
+ * return p_reqcnt
+ * if buf not enough, realloc it.
  * */
-//TODO: return msg number.
-static int myread(FILE * fp, char ** buf, int * buf_size){
+static int myread(FILE * fp, char ** buf, int * buf_size, int * p_reqcnt){
     int i = 0;
     int totSize = 0;
     int ret = 0;
     int len = 0;
+
     Msg* msg = NULL;
 
     msg = readMsg(fp);
@@ -1626,7 +1628,7 @@ static int myread(FILE * fp, char ** buf, int * buf_size){
     }
 
     if (!cmdSupport(msg)){
-        /*NOTICE("cmd not support: %s", msg->argv[0]);*/ //TODO
+        NOTICE("cmd not support: %s", msg->argv[0]); //TODO
         return 0;
     }
 
@@ -1648,9 +1650,13 @@ static int myread(FILE * fp, char ** buf, int * buf_size){
         *buf = zrealloc(*buf, *buf_size);
     }
 
+    *p_reqcnt = 0;
     for(i=0;i<num; i++){
         ret = formatMsg(*buf + len, msgs[i]);
-        len += ret;
+        if (ret){
+            (*p_reqcnt) ++;
+            len += ret;
+        }
         freeMsg(msgs[i]);
     }
     zfree(msgs);
@@ -1747,7 +1753,8 @@ static void replayMode(void) {
             }
             /* If buffer is empty, load from file. */
             if (obuf_len == 0) {
-                ssize_t nread = myread(fp, &obuf, &obuf_size);
+                int reqcnt = 0;
+                ssize_t nread = myread(fp, &obuf, &obuf_size, &reqcnt);
                 DEBUG("myread return %d: %s", nread, obuf);
                 if (nread == 0) {
                     DEBUG("myread got 0 bytes");
@@ -1757,7 +1764,7 @@ static void replayMode(void) {
                 } else {
                     obuf_len = nread;
                     obuf_pos = 0;
-                    requests ++;//TODO +=?
+                    requests += reqcnt;
                 }
             }
         }
