@@ -1285,7 +1285,7 @@ int readLong(FILE *fp, char prefix) {
 }
 
 typedef struct Msg{
-    int argc;
+    int argc; // if argc < 0, means this msg is not used
     char ** argv;
 }Msg;
 
@@ -1309,7 +1309,8 @@ static Msg* dupMsg(Msg * orig){
 static void freeMsg(Msg * msg){
     DEBUG("freeMsg: %p", msg);
     int i = 0;
-    for(i=0; i < msg->argc; i++){
+
+    for(i=0; i < abs(msg->argc); i++){
         sdsfree(msg->argv[i]);
         msg->argv[i] = NULL;
     }
@@ -1372,7 +1373,7 @@ err:
 }
 
 static int sizeofMsg(Msg * msg){
-    if(0 == msg->argc){ //TODO: should not be 0
+    if(msg->argc<=0){
         return 0;
     }
     int ret = 0, i = 0;
@@ -1395,7 +1396,7 @@ static int formatMsg(char *buf, Msg *msg){
     char * orig = buf;
     int ret = 0, i = 0;
 
-    if(0 == msg->argc){//TODO: should not be 0
+    if(msg->argc <= 0){
         return 0;
     }
 
@@ -1532,9 +1533,10 @@ return: 0 on success
 static int rewriteMsg(Msg *msg, Msg ***o_msgs, int *o_num){
     Msg ** msgs;
     int i;
-    int keys; //keys
+    int keys; //keys (number of cmds)
     char * cmd = msg->argv[0];
 
+    //split if need
     if (0 == strcmp("MSET", cmd)) {
         keys = (msg->argc - 1 ) / 2;
         msgs = zmalloc(keys*sizeof(Msg));
@@ -1566,6 +1568,41 @@ static int rewriteMsg(Msg *msg, Msg ***o_msgs, int *o_num){
         msgs = zmalloc(keys*sizeof(Msg));
         msgs[0] = dupMsg(msg);
     }
+
+
+    //filter
+    if(config.replay_filter){
+        char * prefix = config.replay_filter;
+        int len_prefix = strlen(config.replay_filter);
+
+        for (i=0; i<keys; i++){
+            if (strncmp(prefix, msgs[i]->argv[1], len_prefix) != 0){
+                msgs[i]->argc = - msgs[i]->argc;
+                continue;
+            }
+        }
+    }
+
+    //rewrite prefix
+    if(config.replay_orig && config.replay_rewrite){
+        int len_orig = strlen(config.replay_orig);
+        int len_rewrite = strlen(config.replay_rewrite);
+
+        for (i=0; i<keys; i++){
+            if (msgs[i]->argc<=0){ //not used
+                continue;
+            }
+            char * oldkey = msgs[i]->argv[1];
+            int len_newkey = sdslen(oldkey) - len_orig + len_rewrite;
+            char * newkey = sdsnewlen(NULL, len_newkey);
+            memcpy(newkey, config.replay_rewrite, len_rewrite);
+            memcpy(newkey+len_rewrite, oldkey+len_orig, sdslen(oldkey) - len_orig);
+            sdsfree(oldkey);
+            msgs[i]->argv[1] = newkey;
+            DEBUG("newkey: %p, %s", newkey, newkey);
+        }
+    }
+
     *o_msgs = msgs;
     *o_num = keys;
     return 0;
@@ -1686,7 +1723,7 @@ static void replayMode(void) {
                     }
                     replies++;
                     if (replies % 10000 == 0){
-                        NOTICE("%lld done!", replies);
+                        NOTICE("requests: %lld, replies: %lld ", requests, replies);
                     }
                     freeReplyObject(reply);
                 }
