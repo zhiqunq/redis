@@ -1287,7 +1287,6 @@ int readLong(FILE *fp, char prefix) {
 typedef struct Msg{
     int argc;
     char ** argv;
-    size_t *argvlen;
 }Msg;
 
 static Msg* newMsg(int argc){
@@ -1295,7 +1294,6 @@ static Msg* newMsg(int argc){
     msg = zmalloc(sizeof(Msg));
     msg->argc = argc;
     msg->argv = zmalloc(sizeof(char*) * msg->argc);
-    msg->argvlen = zmalloc(sizeof(size_t) * msg->argc);
     return msg;
 }
 
@@ -1304,20 +1302,20 @@ static Msg* dupMsg(Msg * orig){
     int i;
     for(i=0; i<orig->argc; i++){
         msg->argv[i] = sdsdup(orig->argv[i]);
-        msg->argvlen[i] = orig->argvlen[i];
     }
     return msg;
 }
 
 static void freeMsg(Msg * msg){
+    DEBUG("freeMsg: %p", msg);
     int i = 0;
     for(i=0; i < msg->argc; i++){
         sdsfree(msg->argv[i]);
         msg->argv[i] = NULL;
     }
     zfree(msg->argv);
-    zfree(msg->argvlen);
     zfree(msg);
+    DEBUG("freeMsg done");
 }
 
 //read one msg
@@ -1345,7 +1343,6 @@ static Msg* readMsg(FILE * fp){
 
     for (i = 0; i < msg->argc; i++) {
         len = readLong(fp, '$');
-        msg->argvlen[i] = len;
 
         if (len < 1) {
             ERROR("readLong return: %d", len);
@@ -1372,6 +1369,50 @@ err:
     if(msg)
         freeMsg(msg);
     return NULL;
+}
+
+static int sizeofMsg(Msg * msg){
+    if(0 == msg->argc){ //TODO: should not be 0
+        return 0;
+    }
+    int ret = 0, i = 0;
+    int len = 0;
+    ret = snprintf(NULL, 0, "*%d\r\n", msg->argc);
+    len += ret;
+    for (i = 0; i<msg->argc; i++){
+        ret = snprintf(NULL, 0, "$%ld\r\n", sdslen(msg->argv[i]));
+        len += ret;
+
+        len += sdslen(msg->argv[i]);
+
+        len += 2;
+    }
+    return len;
+}
+
+//return len
+static int formatMsg(char *buf, Msg *msg){
+    char * orig = buf;
+    int ret = 0, i = 0;
+
+    if(0 == msg->argc){//TODO: should not be 0
+        return 0;
+    }
+
+    ret = sprintf(buf, "*%d\r\n", msg->argc);
+    buf += ret;
+
+    for (i = 0; i<msg->argc; i++){
+        ret = sprintf(buf, "$%ld\r\n", sdslen(msg->argv[i]));
+        buf += ret;
+
+        memcpy(buf, msg->argv[i], sdslen(msg->argv[i]));
+        buf += sdslen(msg->argv[i]);
+
+        ret = sprintf(buf, "\r\n");
+        buf += ret;
+    }
+    return buf - orig;
 }
 
 #define CMD_SUPPORTED_NUM 80
@@ -1487,16 +1528,16 @@ output:
     msgs: array of msg after rewrite
     num: len of msgs after rewrite
 return: 0 on success
-TODO: remove argvlen in msg.
 */
-static int rewriteMsg(Msg *msg, Msg **msgs, int *num){
+static int rewriteMsg(Msg *msg, Msg ***o_msgs, int *o_num){
+    Msg ** msgs;
     int i;
     int keys; //keys
     char * cmd = msg->argv[0];
 
     if (0 == strcmp("MSET", cmd)) {
         keys = (msg->argc - 1 ) / 2;
-        *msgs = zmalloc(keys*sizeof(Msg));
+        msgs = zmalloc(keys*sizeof(Msg));
         for(i=0; i<keys; i++){
             msgs[i] = newMsg(3);
             msgs[i]->argv[0] = sdsnew("SET");
@@ -1505,7 +1546,7 @@ static int rewriteMsg(Msg *msg, Msg **msgs, int *num){
         }
     } else if (0 == strcmp("MSETNX", cmd)) {
         keys = (msg->argc - 1 ) / 2;
-        *msgs = zmalloc(keys*sizeof(Msg));
+        msgs = zmalloc(keys*sizeof(Msg));
         for(i=0; i<keys; i++){
             msgs[i] = newMsg(3);
             msgs[i]->argv[0] = sdsnew("SETNX");
@@ -1514,7 +1555,7 @@ static int rewriteMsg(Msg *msg, Msg **msgs, int *num){
         }
     } else if (0 == strcmp("DEL", cmd)) {
         keys = (msg->argc - 1 ) ;
-        *msgs = zmalloc(keys*sizeof(Msg));
+        msgs = zmalloc(keys*sizeof(Msg));
         for(i=0; i<keys; i++){
             msgs[i] = newMsg(2);
             msgs[i]->argv[0] = sdsnew("DEL");
@@ -1522,56 +1563,12 @@ static int rewriteMsg(Msg *msg, Msg **msgs, int *num){
         }
     } else {
         keys = 1;
-        *msgs = zmalloc(keys*sizeof(Msg));
+        msgs = zmalloc(keys*sizeof(Msg));
         msgs[0] = dupMsg(msg);
     }
-    *num = keys;
+    *o_msgs = msgs;
+    *o_num = keys;
     return 0;
-}
-
-//TODO: move up
-static int sizeofMsg(Msg * msg){
-    if(0 == msg->argc){ //TODO: should not be 0
-        return 0;
-    }
-    int ret = 0, i = 0;
-    int len = 0;
-    ret = snprintf(NULL, 0, "*%d\r\n", msg->argc);
-    len += ret;
-    for (i = 0; i<msg->argc; i++){
-        ret = snprintf(NULL, 0, "$%ld\r\n", sdslen(msg->argv[i]));
-        len += ret;
-
-        len += sdslen(msg->argv[i]);
-
-        len += 2;
-    }
-    return len;
-}
-
-//return len
-static int formatMsg(char *buf, Msg *msg){
-    char * orig = buf;
-    int ret = 0, i = 0;
-
-    if(0 == msg->argc){//TODO: should not be 0
-        return 0;
-    }
-
-    ret = sprintf(buf, "*%d\r\n", msg->argc);
-    buf += ret;
-
-    for (i = 0; i<msg->argc; i++){
-        ret = sprintf(buf, "$%ld\r\n", sdslen(msg->argv[i]));
-        buf += ret;
-
-        memcpy(buf, msg->argv[i], sdslen(msg->argv[i]));
-        buf += sdslen(msg->argv[i]);
-
-        ret = sprintf(buf, "\r\n");
-        buf += ret;
-    }
-    return buf - orig;
 }
 
 /*
@@ -1596,7 +1593,7 @@ static int myread(FILE * fp, char ** buf, int * buf_size){
         return 0;
     }
 
-    Msg *msgs = NULL;
+    Msg **msgs = NULL;
     int num = 0;
     ret = rewriteMsg(msg, &msgs, &num);
     if (ret != 0){
@@ -1605,9 +1602,8 @@ static int myread(FILE * fp, char ** buf, int * buf_size){
     }
     DEBUG("after rewriteMsg, num: %d", num);
 
-
     for(i=0; i<num; i++){
-        totSize += sizeofMsg(msgs+i);
+        totSize += sizeofMsg(msgs[i]);
     }
 
     if (totSize > *buf_size){
@@ -1616,64 +1612,15 @@ static int myread(FILE * fp, char ** buf, int * buf_size){
     }
 
     for(i=0;i<num; i++){
-        ret = formatMsg(*buf + len, msgs+i);
+        ret = formatMsg(*buf + len, msgs[i]);
         len += ret;
-        freeMsg(msgs+i);
+        freeMsg(msgs[i]);
     }
     zfree(msgs);
     freeMsg(msg);
 
     DEBUG("myread return %d", len);
     return len;
-}
-
-/*
- * for gprof
- * */
-static void sighandler( int sig_no ) { exit(0); }
-
-/**
- *
- * safe replay (one by one)
- * 7k - 8k on twemproxy
- * 11k on redis
- */
-static int safeReplayMode(void){
-    int cnt = 0;
-    Msg* msg;
-    redisReply *reply;
-    FILE *fp = NULL;
-
-    signal(SIGUSR1, sighandler );// for gprof
-
-    fp = fopen(config.replay_filename, "r");
-    if (!fp) {
-        fprintf(stderr,
-            "Can't open file '%s': %s\n", config.eval, strerror(errno));
-        exit(1);
-    }
-
-    NOTICE("start");
-    cnt = 0;
-    while(1){
-        msg = readMsg(fp);
-        if(!msg){
-            ERROR("error on readMsg");
-            return -1;
-        }
-
-        cnt ++;
-        if (cnt%100000 == 0){
-            NOTICE("%d done!", cnt);
-        }
-        reply = redisCommandArgv(context, msg->argc, (const char **)msg->argv, msg->argvlen);
-        if (!reply){
-            ERROR("Error on cmd %d %s %s", msg->argc, msg->argv[0], msg->argv[1]);
-            return -1;
-        }
-        freeReplyObject(reply);
-        freeMsg(msg);
-    }
 }
 
 static void replayMode(void) {
