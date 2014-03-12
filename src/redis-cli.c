@@ -1160,6 +1160,9 @@ static void getRDB(void) {
     exit(0);
 }
 
+/*
+ * not work
+ * */
 int _blockWait(FILE * fp){
     fd_set rfds;
     struct timeval tv;
@@ -1215,7 +1218,7 @@ int blockWait(FILE * fp){
     return 0;
 }
 
-//like fgets,but block,
+//like fgets, but block,
 //return 0 on success
 //return -1 if can not find '\n' after 'size' bytes
 int blockReadline(FILE * fp, char * buf, int size){
@@ -1261,9 +1264,10 @@ int blockReadBytes(FILE * fp, char * buf, int size){
 
         readed += ret;
         if (readed == size){
-            return readed;
+            break;
         }
     }
+    return readed;
 }
 
 int readLong(FILE *fp, char prefix) {
@@ -1291,11 +1295,21 @@ static Msg* newMsg(int argc){
     msg = zmalloc(sizeof(Msg));
     msg->argc = argc;
     msg->argv = zmalloc(sizeof(char*) * msg->argc);
-    msg->argvlen = zmalloc(msg->argc);
+    msg->argvlen = zmalloc(sizeof(size_t) * msg->argc);
     return msg;
 }
 
-void freeMsg(Msg * msg){
+static Msg* dupMsg(Msg * orig){
+    Msg * msg = newMsg(orig->argc);
+    int i;
+    for(i=0; i<orig->argc; i++){
+        msg->argv[i] = sdsdup(orig->argv[i]);
+        msg->argvlen[i] = orig->argvlen[i];
+    }
+    return msg;
+}
+
+static void freeMsg(Msg * msg){
     int i = 0;
     for(i=0; i < msg->argc; i++){
         sdsfree(msg->argv[i]);
@@ -1308,13 +1322,13 @@ void freeMsg(Msg * msg){
 
 //read one msg
 //return 0 on success
-//return -1 on error
+//return NULL on error
 static Msg* readMsg(FILE * fp){
     int i = 0;
     int len = 0;
     int ret = 0;
     char buf[128];
-    Msg * msg;
+    Msg * msg= NULL;
 
     len = readLong(fp, '*');
     if (len < 1) {
@@ -1322,7 +1336,12 @@ static Msg* readMsg(FILE * fp){
         return NULL;
     }
     DEBUG("got argc: %d", len);
+
     msg = newMsg(len);
+    if (!msg) {
+        ERROR("error on newMsg");
+        goto err;
+    }
 
     for (i = 0; i < msg->argc; i++) {
         len = readLong(fp, '$');
@@ -1330,29 +1349,32 @@ static Msg* readMsg(FILE * fp){
 
         if (len < 1) {
             ERROR("readLong return: %d", len);
-            return NULL;
+            goto err;
         }
         msg->argv[i] = sdsnewlen(NULL, len);
         ret = blockReadBytes(fp, msg->argv[i], len);
         if (ret == -1) {
             ERROR("blockReadBytes return: %d", ret);
-            return NULL;
+            goto err;
         }
 
         ret = blockReadBytes(fp, buf, 2); //CRCL
         if (ret == -1) {
             ERROR("blockReadBytes return: %d", ret);
-            return NULL;
+            goto err;
         }
-
         DEBUG("got arg: %s", msg->argv[i]);
     }
     char * cmd = msg->argv[0];
     sdstoupper(cmd);
     return msg;
+err:
+    if(msg)
+        freeMsg(msg);
+    return NULL;
 }
 
-#define CMD_SUPPORTED_NUM 78
+#define CMD_SUPPORTED_NUM 80
 
 /**
 78 cmd gen by:  cat notes/redis.md  | grep 'Yes ' | awk '{print $2}' | vim -
@@ -1362,9 +1384,9 @@ exceptions:
 
 */
 static char * CMD_SUPPORTED[] = {
-    "MSET", //change to many, then filter and rewrite
-    "MSETNX", //change to many, then filter and rewrite
-    "DEL",  //change to many, then filter and rewrite
+    "MSET",     //change to many, then filter and rewrite
+    "MSETNX",   //change to many, then filter and rewrite
+    "DEL",      //change to many, then filter and rewrite
     "SET",
     "HMSET",
     "EXPIRE",
@@ -1444,7 +1466,8 @@ static char * CMD_SUPPORTED[] = {
     "ZSCORE",
 };
 
-static int cmdSupport(char * cmd){
+static int cmdSupport(Msg *msg){
+    char * cmd = msg->argv[0];
     int i = 0;
     for(i=0; i<CMD_SUPPORTED_NUM; i++){
         if(0 == strcmp(CMD_SUPPORTED[i], cmd)){
@@ -1454,30 +1477,61 @@ static int cmdSupport(char * cmd){
     return 0;
 }
 
-/**
- * filter to check if it's supported
- * if the cmd is multikey MSET/MSETNX/DEL, split it.
- */
-//TODO: if is delete, rewrite all keys.
-static int filterMsg(Msg *msg){
+/*
+1. if the cmd is MSET/MSETNX/DEL, split it, change it to SET/SETNX/DEL
+2. filter by key
+3. rewrite keys
+
+input: msg
+output:
+    msgs: array of msg after rewrite
+    num: len of msgs after rewrite
+return: 0 on success
+TODO: remove argvlen in msg.
+*/
+static int rewriteMsg(Msg *msg, Msg **msgs, int *num){
+    int i;
+    int keys; //keys
     char * cmd = msg->argv[0];
-    if(!cmdSupport(cmd)){
-        msg->argc = 0;
+
+    if (0 == strcmp("MSET", cmd)) {
+        keys = (msg->argc - 1 ) / 2;
+        *msgs = zmalloc(keys*sizeof(Msg));
+        for(i=0; i<keys; i++){
+            msgs[i] = newMsg(3);
+            msgs[i]->argv[0] = sdsnew("SET");
+            msgs[i]->argv[1] = sdsdup(msg->argv[1+i*2]);
+            msgs[i]->argv[2] = sdsdup(msg->argv[1+i*2+1]);
+        }
+    } else if (0 == strcmp("MSETNX", cmd)) {
+        keys = (msg->argc - 1 ) / 2;
+        *msgs = zmalloc(keys*sizeof(Msg));
+        for(i=0; i<keys; i++){
+            msgs[i] = newMsg(3);
+            msgs[i]->argv[0] = sdsnew("SETNX");
+            msgs[i]->argv[1] = sdsdup(msg->argv[1+i*2]);
+            msgs[i]->argv[2] = sdsdup(msg->argv[1+i*2+1]);
+        }
+    } else if (0 == strcmp("DEL", cmd)) {
+        keys = (msg->argc - 1 ) ;
+        *msgs = zmalloc(keys*sizeof(Msg));
+        for(i=0; i<keys; i++){
+            msgs[i] = newMsg(2);
+            msgs[i]->argv[0] = sdsnew("DEL");
+            msgs[i]->argv[1] = sdsdup(msg->argv[1+i]);
+        }
+    } else {
+        keys = 1;
+        *msgs = zmalloc(keys*sizeof(Msg));
+        msgs[0] = dupMsg(msg);
     }
+    *num = keys;
     return 0;
 }
 
-/*
-1. filter by cmd
-2. filter by key
-3. rewrite keys
-*/
-static int rewriteKey(Msg *msg){
-
-}
-
+//TODO: move up
 static int sizeofMsg(Msg * msg){
-    if(0 == msg->argc){
+    if(0 == msg->argc){ //TODO: should not be 0
         return 0;
     }
     int ret = 0, i = 0;
@@ -1500,7 +1554,7 @@ static int formatMsg(char *buf, Msg *msg){
     char * orig = buf;
     int ret = 0, i = 0;
 
-    if(0 == msg->argc){
+    if(0 == msg->argc){//TODO: should not be 0
         return 0;
     }
 
@@ -1520,47 +1574,64 @@ static int formatMsg(char *buf, Msg *msg){
     return buf - orig;
 }
 
-
-/*TODO: if batchsize is not 1, and at the end of file, it will wait (may lost msgs)*/
-//TODO: return request number.
-// batch=1: 6w, batch=10: 8w.
-#define BATCHSIZE 1
-
+/*
+ * return bytes readed
+ * */
+//TODO: return msg number.
 static int myread(FILE * fp, char ** buf, int * buf_size){
-    Msg* msgs[BATCHSIZE];
-    int i;
+    int i = 0;
     int totSize = 0;
     int ret = 0;
     int len = 0;
+    Msg* msg = NULL;
 
-    for(i = 0; i< BATCHSIZE; i++){
-        msgs[i] = readMsg(fp);
-        if(!msgs[i]){
-            ERROR("error on readMsg");
-            return -1;
-        }
-        ret = filterMsg(msgs[i]);
-        if(ret < 0){
-            ERROR("error on filterMsg");
-            return -1;
-        }
-        totSize += sizeofMsg(msgs[i]);
+    msg = readMsg(fp);
+    if(!msg){
+        ERROR("error on readMsg");
+        return -1;
     }
+
+    if (!cmdSupport(msg)){
+        /*NOTICE("cmd not support: %s", msg->argv[0]);*/ //TODO
+        return 0;
+    }
+
+    Msg *msgs = NULL;
+    int num = 0;
+    ret = rewriteMsg(msg, &msgs, &num);
+    if (ret != 0){
+        ERROR("error on rewriteMsg");
+        return -1;
+    }
+    DEBUG("after rewriteMsg, num: %d", num);
+
+
+    for(i=0; i<num; i++){
+        totSize += sizeofMsg(msgs+i);
+    }
+
     if (totSize > *buf_size){
         *buf_size = totSize + 1024;
         *buf = zrealloc(*buf, *buf_size);
     }
 
-    for(i = 0; i< BATCHSIZE; i++){
-        ret = formatMsg(*buf + len, msgs[i]);
+    for(i=0;i<num; i++){
+        ret = formatMsg(*buf + len, msgs+i);
         len += ret;
-        freeMsg(msgs[i]);
+        freeMsg(msgs+i);
     }
+    zfree(msgs);
+    freeMsg(msg);
+
     DEBUG("myread return %d", len);
     return len;
 }
 
+/*
+ * for gprof
+ * */
 static void sighandler( int sig_no ) { exit(0); }
+
 /**
  *
  * safe replay (one by one)
@@ -1569,7 +1640,6 @@ static void sighandler( int sig_no ) { exit(0); }
  */
 static int safeReplayMode(void){
     int cnt = 0;
-    int ret;
     Msg* msg;
     redisReply *reply;
     FILE *fp = NULL;
@@ -1590,12 +1660,6 @@ static int safeReplayMode(void){
         if(!msg){
             ERROR("error on readMsg");
             return -1;
-        }
-
-        ret = filterMsg(msg);
-
-        if (msg->argc == 0){
-            continue;
         }
 
         cnt ++;
