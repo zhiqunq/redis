@@ -1697,7 +1697,7 @@ static void replayMode(void) {
     while(1) {
         int mask = AE_READABLE;
         DEBUG("request: %lld, replies: %lld", requests, replies);
-#define PIPESIZE 10
+#define PIPESIZE 1000
         if ((requests - replies <= PIPESIZE) || (obuf_len != 0) )
             mask |= AE_WRITABLE;
         mask = aeWait(fd,mask,1000);
