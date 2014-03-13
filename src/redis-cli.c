@@ -1697,7 +1697,8 @@ static void replayMode(void) {
     while(1) {
         int mask = AE_READABLE;
         DEBUG("request: %lld, replies: %lld", requests, replies);
-        if ((replies == requests) || (obuf_len != 0))
+#define PIPESIZE 10
+        if ((requests - replies <= PIPESIZE) || (obuf_len != 0) )
             mask |= AE_WRITABLE;
         mask = aeWait(fd,mask,1000);
 
@@ -1737,20 +1738,6 @@ static void replayMode(void) {
         }
 
         if (mask & AE_WRITABLE) {
-            if (obuf_len != 0) {
-                ssize_t nwritten = write(fd,obuf+obuf_pos,obuf_len);
-
-                if (nwritten == -1) {
-                    if (errno != EAGAIN && errno != EINTR) {
-                        ERROR("Error writing to the server: %s", strerror(errno));
-                        exit(1);
-                    } else {
-                        nwritten = 0;
-                    }
-                }
-                obuf_len -= nwritten;
-                obuf_pos += nwritten;
-            }
             /* If buffer is empty, load from file. */
             if (obuf_len == 0) {
                 int reqcnt = 0;
@@ -1766,6 +1753,20 @@ static void replayMode(void) {
                     obuf_pos = 0;
                     requests += reqcnt;
                 }
+            }
+            if (obuf_len != 0) {
+                ssize_t nwritten = write(fd,obuf+obuf_pos,obuf_len);
+
+                if (nwritten == -1) {
+                    if (errno != EAGAIN && errno != EINTR) {
+                        ERROR("Error writing to the server: %s", strerror(errno));
+                        exit(1);
+                    } else {
+                        nwritten = 0;
+                    }
+                }
+                obuf_len -= nwritten;
+                obuf_pos += nwritten;
             }
         }
     }
