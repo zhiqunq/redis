@@ -1,3 +1,12 @@
+replay(for practice purpose)
+----------------------------
+
+::
+
+    ./redis-cli -h 127.0.0.5 -p 22000 --replay ~/Desktop/t/appendonly.aof
+    ./redis-cli -h 127.0.0.5 -p 24000 --replay ~/Desktop/t/appendonly.aof --filter kkk-1000 --orig kkk --rewrite xxxxxx
+
+
 Where to find complete Redis documentation?
 -------------------------------------------
 
