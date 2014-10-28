@@ -50,6 +50,8 @@
 #define NDS_TIMER_START unsigned long long start = ustime();
 #define NDS_TIMER_END server.stat_nds_usec += ustime()-start;
 
+#define min(a, b)	(a) < (b) ? a : b
+
 /* Generate the name of the freezer we want, based on the database passed
  * in, and stuff the name into buf. */
 static void freezer_filename(redisDb *db, char *buf) {
@@ -170,6 +172,10 @@ static NDSDB *nds_open(redisDb *db, int writer) {
         /* Ensure the mapsize is a multiple of the page size, because
          * grumble grumble */
         mapsize = (mapsize / sysconf(_SC_PAGESIZE)) * sysconf(_SC_PAGESIZE);
+#if ((ULONG_MAX) == (UINT_MAX))
+        // can't exceed 2G on 32bit system.
+        mapsize = min(mapsize, 2147483648);
+#endif
         
         redisLog(REDIS_DEBUG, "Setting mapsize to %llu", mapsize);
                     
