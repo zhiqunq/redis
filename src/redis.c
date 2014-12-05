@@ -1922,6 +1922,7 @@ int prepareForShutdown(int flags) {
     }
     if (server.nds) {
         redisLog(REDIS_NOTICE, "Flushing dirty keys to NDS before exiting.");
+        // FIXME What if background flush is running?
         flushDirtyKeys();
     } else {
         if ((server.saveparamslen > 0 && !nosave) || save) {

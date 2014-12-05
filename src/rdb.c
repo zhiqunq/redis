@@ -654,6 +654,12 @@ int rdbSave(char *filename) {
     rio rdb;
     uint64_t cksum;
 
+    if (server.nds) {
+        // FIXME What if background flush is running?
+        if (flushDirtyKeys() != REDIS_OK)
+            return REDIS_ERR;
+    }
+
     snprintf(tmpfile,256,"temp-%d.rdb", (int) getpid());
     fp = fopen(tmpfile,"w");
     if (!fp) {
