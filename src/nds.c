@@ -452,19 +452,21 @@ void preforkNDS(void) {
     server.ndsdb.env = NULL;
 }
 
-robj *getNDS(redisDb *db, robj *key) {
+robj *getNDSRaw(redisDb *db, robj *key, long long *expire) {
     sds val = NULL;
     rio payload;
     int type;
     robj *obj = NULL;
     NDSDB *ndsdb = nds_open(db, 0);
-    NDS_TIMER_START;
+    *expire = -1;
     
     redisLog(REDIS_DEBUG, "Looking up %s in NDS", (char *)key->ptr);
 
     if (!ndsdb) {
         return NULL;
     }
+
+    NDS_TIMER_START;
     
     val = nds_get(ndsdb, key->ptr);
     
@@ -484,13 +486,8 @@ robj *getNDS(redisDb *db, robj *key) {
         }
         
         if (obj) {
-            sds copy = sdsdup(key->ptr);
-            redisAssertWithInfo(NULL, key, dictAdd(db->dict, copy, obj) == REDIS_OK);
-            
             if (rdbLoadType(&payload) == REDIS_RDB_OPCODE_EXPIRETIME_MS) {
-                long long expire = rdbLoadMillisecondTime(&payload);
-                redisLog(REDIS_DEBUG, "Setting expiry time to %lld", expire);
-                setExpire(db, key, expire);
+                *expire = rdbLoadMillisecondTime(&payload);
             }
         }
     }
@@ -500,6 +497,22 @@ nds_cleanup:
         sdsfree(val);
     }
     NDS_TIMER_END;
+    return obj;
+}
+
+robj *getNDS(redisDb *db, robj *key) {
+    long long expire = -1;
+    robj *obj = getNDSRaw(db, key, &expire);
+
+    if (obj) {
+        sds copy = sdsdup(key->ptr);
+        redisAssertWithInfo(NULL, key, dictAdd(db->dict, copy, obj) == REDIS_OK);
+        
+        if (expire != -1) {
+            redisLog(REDIS_DEBUG, "Setting expiry time to %lld", expire);
+            setExpire(db, key, expire);
+        }
+    }
     return obj;
 }
 
