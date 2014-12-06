@@ -908,14 +908,15 @@ int *zunionInterGetKeys(struct redisCommand *cmd,robj **argv, int argc, int *num
 robj *lookupKeyRaw(redisDb *db, robj *key, long long *expire) {
     robj *val = NULL;
     dictEntry *de = dictFind(db->dict,key->ptr);
+    dictEntry *de1 = NULL;
     
     if (de) {
         if (dictSize(db->expires) == 0 ||
-           (de = dictFind(db->expires,key->ptr)) == NULL) {
+           (de1 = dictFind(db->expires,key->ptr)) == NULL) {
             *expire = -1;
         }
         else {
-            *expire = dictGetSignedIntegerVal(de);
+            *expire = dictGetSignedIntegerVal(de1);
         }
         val = dictGetVal(de);
         incrRefCount(val);
