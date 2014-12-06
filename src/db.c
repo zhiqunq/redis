@@ -619,25 +619,24 @@ long long getExpire(redisDb *db, robj *key) {
     long long expire = -1;
     robj *val = NULL;
 
-    if (dictSize(db->expires) == 0 ||
-       (de = dictFind(db->expires,key->ptr)) == NULL) {
-        if (server.nds) {
-            val = getNDSRaw(db, key, &expire);
-            if (val) {
-                decrRefCount(val);
-            }
-            return expire;
-        }
-        else {
+    if (dictFind(db->dict, key->ptr)) {
+        if (dictSize(db->expires) == 0 ||
+           (de = dictFind(db->expires,key->ptr)) == NULL)
             /* No expire? return ASAP */
             return -1;
-        }
-    }
 
-    /* The entry was found in the expire dict, this means it should also
-     * be present in the main dict (safety check). */
-    redisAssertWithInfo(NULL,key,dictFind(db->dict,key->ptr) != NULL);
-    return dictGetSignedIntegerVal(de);
+        /* The entry was found in the expire dict, this means it should also
+         * be present in the main dict (safety check). */
+        return dictGetSignedIntegerVal(de);
+    }
+    else if (server.nds) {
+        val = getNDSRaw(db, key, &expire);
+        if (val) {
+            decrRefCount(val);
+        }
+        return expire;
+    }
+    return -1;
 }
 
 /* Propagate expires into slaves and the AOF file.
