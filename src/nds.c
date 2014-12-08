@@ -554,6 +554,11 @@ int emptyNDS(redisDb *db) {
     redisLog(REDIS_DEBUG, "emptyNDS(db=%i) => REDIS_OK", db->id);
     nds_close(ndsdb);
     NDS_TIMER_END;
+
+    dictEmpty(db->dirty_keys);
+    dictEmpty(db->flushing_keys);
+    dictEmpty(db->nds_keys);
+
     return REDIS_OK;
 }
 
@@ -823,12 +828,12 @@ int backgroundDirtyKeysFlush(void) {
 }
 
 int flushDirtyKeys(void) {
+    dictIterator *di = NULL;
     NDS_TIMER_START;
     
     redisLog(REDIS_DEBUG, "Flushing dirty keys");
     for (int j = 0; j < server.dbnum; j++) {
         redisDb *db = server.db+j;
-        dictIterator *di;
         dictEntry *deKey, *deVal;
         NDSDB *ndsdb;
 
@@ -836,16 +841,19 @@ int flushDirtyKeys(void) {
         
         if (dictSize(db->dirty_keys) == 0) continue;
 
+        if (di) {
+            dictReleaseIterator(di);
+        }
         di = dictGetSafeIterator(db->dirty_keys);
         if (!di) {
             redisLog(REDIS_WARNING, "dictGetSafeIterator failed");
-            return REDIS_ERR;
+            goto werr;
         }
 
         ndsdb = nds_open(db, 1);        
 
         if (!ndsdb) {
-            return REDIS_ERR;
+            goto werr;
         }
         
         while ((deKey = dictNext(di)) != NULL) {
@@ -862,8 +870,7 @@ int flushDirtyKeys(void) {
                 redisLog(REDIS_DEBUG, "Deleting key '%s' from NDS", keystr);
                 if (nds_del(ndsdb, keystr) == -1) {
                     redisLog(REDIS_WARNING, "nds_del returned error, flush failed");
-                    NDS_TIMER_END;
-                    return REDIS_ERR;
+                    goto werr;
                 }
             } else {
                 rio payload;
@@ -885,7 +892,7 @@ int flushDirtyKeys(void) {
                 if (nds_set(ndsdb, keystr, payload.io.buffer.ptr) == REDIS_ERR) {
                     redisLog(REDIS_WARNING, "nds_set returned error, flush failed");
                     sdsfree(payload.io.buffer.ptr);
-                    return REDIS_ERR;
+                    goto werr;
                 }
                 sdsfree(payload.io.buffer.ptr);
             }
@@ -922,6 +929,12 @@ int flushDirtyKeys(void) {
     
     NDS_TIMER_END;
     return REDIS_OK;
+
+werr:
+    NDS_TIMER_END;
+    if(di)
+        dictReleaseIterator(di);
+    return REDIS_ERR;
 }
 
 void postNDSFlushCleanup(void) {
@@ -973,6 +986,7 @@ void backgroundNDSFlushDoneHandler(int exitcode, int bysignal) {
                 dictAdd(db->dirty_keys, sdsdup(dictGetKey(de)), NULL);
             }
             
+            dictReleaseIterator(di);
             dictEmpty(db->flushing_keys);
         }
         
@@ -1082,8 +1096,6 @@ void ndsMemkeysCommand(redisClient *c) {
     dictEntry *de;
     int numkeys = 0;
     
-    di = dictGetSafeIterator(c->db->dict);
-    
     while ((de = dictNext(di)) != NULL) {
         sds key = dictGetKey(de);
         robj *keyobj = createStringObject(key, sdslen(key));
@@ -1092,6 +1104,7 @@ void ndsMemkeysCommand(redisClient *c) {
         decrRefCount(keyobj);
         numkeys++;
     }
+    dictReleaseIterator(di);
     setDeferredMultiBulkLength(c, rlen, numkeys);
 }
 
