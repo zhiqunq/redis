@@ -2580,7 +2580,7 @@ int freeMemoryIfNeededNDS(void) {
             }
             if (dictSize(dict) == 0) {
                 redisLog(REDIS_DEBUG, "Database %i is empty while trying to find a random key to evict", bestdb);
-                bestdb = -1;
+                continue;
             } else {
                 struct dictEntry *de = dictGetRandomKey(dict);
                 bestkey = dictGetKey(de);
