@@ -522,7 +522,7 @@ void configSetCommand(redisClient *c) {
         if (getLongLongFromObject(o,&ll) == REDIS_ERR ||
             ll < 0) goto badfmt;
         server.maxmemory = ll;
-        if (server.nds && server.nds_watermark >= server.maxmemory) {
+        if (server.nds && server.nds_watermark && server.nds_watermark >= server.maxmemory) {
             server.nds_watermark = server.maxmemory - 1;
         }
         if (server.maxmemory) {
