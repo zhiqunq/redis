@@ -951,7 +951,7 @@ void postNDSFlushCleanup(void) {
 void backgroundNDSFlushDoneHandler(int exitcode, int bysignal) {
     NDS_TIMER_START;
     
-    redisLog(REDIS_NOTICE, "NDS background save completed.  exitcode=%i, bysignal=%i", exitcode, bysignal);
+    redisLog(REDIS_DEBUG, "NDS background save completed.  exitcode=%i, bysignal=%i", exitcode, bysignal);
 
     server.nds_snapshot_in_progress = 0;
 
