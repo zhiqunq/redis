@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 # Copyright 2011 Dvir Volk <dvirsk at gmail dot com>. All rights reserved.
 #
@@ -29,13 +29,30 @@
 # this generates a redis config file and an /etc/init.d script, and installs them
 # this scripts should be run as root
 
-die () {
-	echo "ERROR: $1. Aborting!" 
-	exit 1
-}
+source $(dirname $0)/argparse.bash
+argparse "$@" <<EOF || exit 1
 
-#Initial defaults
-_REDIS_PORT=6379
+_REDIS_PORT        = 6379
+
+parser.add_argument("--REDIS_PORT",        default=_REDIS_PORT, type=int)
+args = parser.parse_known_args()[0]
+_REDIS_PORT = args.REDIS_PORT
+_REDIS_CONFIG_FILE = "/etc/redis/{}.conf".format(_REDIS_PORT)
+_REDIS_LOG_FILE    = "/var/log/redis_{}.log".format(_REDIS_PORT)
+_REDIS_DATA_DIR    = "/var/lib/redis/{}".format(_REDIS_PORT)
+_REDIS_EXECUTABLE  = "`which redis-server`"
+parser.add_argument("--REDIS_CONFIG_FILE", default=_REDIS_CONFIG_FILE)
+parser.add_argument("--REDIS_LOG_FILE",    default=_REDIS_LOG_FILE)
+parser.add_argument("--REDIS_DATA_DIR",    default=_REDIS_DATA_DIR)
+parser.add_argument("--REDIS_EXECUTABLE",  default=_REDIS_EXECUTABLE)
+args = parser.parse_args()
+EOF
+
+
+die () {
+    echo "ERROR: $1. Aborting!" 
+    exit 1
+}
 
 echo "Welcome to the redis service installer"
 echo "This script will help you easily set up a running redis server
@@ -44,57 +61,35 @@ echo "This script will help you easily set up a running redis server
 
 #check for root user TODO: replace this with a call to "id"
 if [ `whoami` != "root" ] ; then
-	echo "You must run this script as root. Sorry!"
-	exit 1
+    echo "You must run this script as root. Sorry!"
+    exit 1
 fi
 
 
 #Read the redis port
-read  -p "Please select the redis port for this instance: [$_REDIS_PORT] " REDIS_PORT 
-if [ ! `echo $REDIS_PORT | egrep "^[0-9]+\$"`  ] ; then
-	echo "Selecting default: $_REDIS_PORT"
-	REDIS_PORT=$_REDIS_PORT 
-fi
+echo "Selecting REDIS_PORT: $REDIS_PORT"
 
 #read the redis config file
-_REDIS_CONFIG_FILE="/etc/redis/$REDIS_PORT.conf"
-read -p "Please select the redis config file name [$_REDIS_CONFIG_FILE] " REDIS_CONFIG_FILE
-if [ !"$REDIS_CONFIG_FILE" ] ; then
-	REDIS_CONFIG_FILE=$_REDIS_CONFIG_FILE
-	echo "Selected default - $REDIS_CONFIG_FILE"
-fi
+echo "Selecting REDIS_CONFIG_FILE - $REDIS_CONFIG_FILE"
+
 #try and create it
 mkdir -p `dirname "$REDIS_CONFIG_FILE"` || die "Could not create redis config directory"
 
 #read the redis log file path
-_REDIS_LOG_FILE="/var/log/redis_$REDIS_PORT.log"
-read -p "Please select the redis log file name [$_REDIS_LOG_FILE] " REDIS_LOG_FILE
-if [ !"$REDIS_LOG_FILE" ] ; then
-	REDIS_LOG_FILE=$_REDIS_LOG_FILE
-	echo "Selected default - $REDIS_LOG_FILE"
-fi
+echo "Selecting REDIS_LOG_FILE - $REDIS_LOG_FILE "
 
+#try and create it
+mkdir -p `dirname "$REDIS_LOG_FILE"` || die "Could not create redis log directory"
 
 #get the redis data directory
-_REDIS_DATA_DIR="/var/lib/redis/$REDIS_PORT"
-read -p "Please select the data directory for this instance [$_REDIS_DATA_DIR] " REDIS_DATA_DIR
-if [ !"$REDIS_DATA_DIR" ] ; then
-	REDIS_DATA_DIR=$_REDIS_DATA_DIR
-	echo "Selected default - $REDIS_DATA_DIR"
-fi
+echo "Selecting REDIS_DATA_DIR - $REDIS_DATA_DIR"
+
 mkdir -p $REDIS_DATA_DIR || die "Could not create redis data directory"
 
 #get the redis executable path
-_REDIS_EXECUTABLE=`which redis-server`
-read -p "Please select the redis executable path [$_REDIS_EXECUTABLE] " REDIS_EXECUTABLE
+echo "Selecting REDIS_EXECUTABLE - $REDIS_EXECUTABLE"
 if [ ! -f "$REDIS_EXECUTABLE" ] ; then
-	REDIS_EXECUTABLE=$_REDIS_EXECUTABLE
-	
-	if [ ! -f "$REDIS_EXECUTABLE" ] ; then
-		echo "Mmmmm...  it seems like you don't have a redis executable. Did you run make install yet?"
-		exit 1
-	fi
-	
+    echo "Mmmmm...  it seems like you don't have a redis executable. Did you run make install yet?"
 fi
 
 
@@ -110,7 +105,7 @@ PIDFILE="/var/run/redis_$REDIS_PORT.pid"
 #check the default for redis cli
 CLI_EXEC=`which redis-cli`
 if [ ! "$CLI_EXEC" ] ; then 
-	CLI_EXEC=`dirname $REDIS_EXECUTABLE`"/redis-cli"
+    CLI_EXEC=`dirname $REDIS_EXECUTABLE`"/redis-cli"
 fi
 
 #Generate config file from the default config file as template
@@ -160,11 +155,11 @@ REDIS_CHKCONFIG_INFO=\
 ### END INIT INFO\n\n"
 
 if [ !`which chkconfig` ] ; then 
-	#combine the header and the template (which is actually a static footer)
-	echo $REDIS_INIT_HEADER > $TMP_FILE && cat $INIT_TPL_FILE >> $TMP_FILE || die "Could not write init script to $TMP_FILE"
+    #combine the header and the template (which is actually a static footer)
+    echo -e $REDIS_INIT_HEADER > $TMP_FILE && cat $INIT_TPL_FILE >> $TMP_FILE || die "Could not write init script to $TMP_FILE"
 else
-	#if we're a box with chkconfig on it we want to include info for chkconfig
-	echo -e $REDIS_INIT_HEADER $REDIS_CHKCONFIG_INFO > $TMP_FILE && cat $INIT_TPL_FILE >> $TMP_FILE || die "Could not write init script to $TMP_FILE"
+    #if we're a box with chkconfig on it we want to include info for chkconfig
+    echo -e $REDIS_INIT_HEADER $REDIS_CHKCONFIG_INFO > $TMP_FILE && cat $INIT_TPL_FILE >> $TMP_FILE || die "Could not write init script to $TMP_FILE"
 fi
 
 #copy to /etc/init.d
@@ -174,14 +169,14 @@ echo "Copied $TMP_FILE => $INIT_SCRIPT_DEST"
 #Install the service
 echo "Installing service..."
 if [ !`which chkconfig` ] ; then 
-	#if we're not a chkconfig box assume we're able to use update-rc.d
-	update-rc.d redis_$REDIS_PORT defaults && echo "Success!"
+    #if we're not a chkconfig box assume we're able to use update-rc.d
+    update-rc.d redis_$REDIS_PORT defaults && echo "Success!"
 else
-	# we're chkconfig, so lets add to chkconfig and put in runlevel 345
-	chkconfig --add redis_$REDIS_PORT && echo "Successfully added to chkconfig!"
-	chkconfig --level 345 redis_$REDIS_PORT on && echo "Successfully added to runlevels 345!"
+    # we're chkconfig, so lets add to chkconfig and put in runlevel 345
+    chkconfig --add redis_$REDIS_PORT && echo "Successfully added to chkconfig!"
+    chkconfig --level 345 redis_$REDIS_PORT on && echo "Successfully added to runlevels 345!"
 fi
-	
+
 /etc/init.d/redis_$REDIS_PORT start || die "Failed starting service..."
 
 #tada
