@@ -35,8 +35,10 @@ argparse "$@" <<EOF || exit 1
 _REDIS_PORT        = 6379
 
 parser.add_argument("--REDIS_PORT",        default=_REDIS_PORT, type=int)
+parser.add_argument("--REDIS_HOST",        default="127.0.0.1", type=string)
 args = parser.parse_known_args()[0]
 _REDIS_PORT = args.REDIS_PORT
+_REDIS_HOST = args.REDIS_HOST
 _REDIS_CONFIG_FILE = "/etc/redis/{}.conf".format(_REDIS_PORT)
 _REDIS_LOG_FILE    = "/var/log/redis_{}.log".format(_REDIS_PORT)
 _REDIS_DATA_DIR    = "/var/lib/redis/{}".format(_REDIS_PORT)
@@ -136,6 +138,7 @@ CLIEXEC=$CLI_EXEC\n
 PIDFILE=$PIDFILE\n
 CONF=\"$REDIS_CONFIG_FILE\"\n\n
 REDISPORT=\"$REDIS_PORT\"\n\n
+REDISHOST=\"$REDIS_HOST\"\n\n
 ###############\n\n"
 
 REDIS_CHKCONFIG_INFO=\
